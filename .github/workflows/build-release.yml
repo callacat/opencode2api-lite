@@ -119,4 +119,5 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd dist
-          gh release create "$GITHUB_REF_NAME" $(find . -type f ! -name sha256sums.txt) --generate-notes
+          # 校验和一并作为 Release 资产上传（下载方可用 sha256sum -c 验证完整性）
+          gh release create "$GITHUB_REF_NAME" $(find . -type f) --generate-notes
