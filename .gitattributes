@@ -1,0 +1,3 @@
+# 统一 LF（源文件来自 Windows 环境，避免 CRLF 混入 diff）
+* text=auto
+*.go text eol=lf

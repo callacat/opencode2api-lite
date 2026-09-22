@@ -1,0 +1,19 @@
+# opencode2api-lite Docker Compose 示例
+#
+# 用法：cp docker-compose.example.yml docker-compose.yml && docker compose up -d
+# 数据（config.json / stats.json）持久化在宿主 ./data，容器删除重建不丢配置。
+#
+# 注意：管理面板默认【不启用】登录验证；对外暴露时务必设置密码（见 command）。
+
+services:
+  opencode2api-lite:
+    image: ghcr.io/callacat/opencode2api-lite:latest
+    container_name: opencode2api-lite
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    # 管理面板密码：留空 = 无认证；对外必须设置
+    command: ["-password", "change-me"]
+    # 更多参数：-port 8000 / -config config.json / -debug

@@ -1,0 +1,12 @@
+.git
+.gitignore
+.github
+dist/
+opencode2api-lite
+opencode2api-lite.exe
+config.json
+stats.json
+*.log
+README.md
+CHANGELOG.md
+docker-compose.example.yml

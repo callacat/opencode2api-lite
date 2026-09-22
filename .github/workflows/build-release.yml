@@ -1,0 +1,122 @@
+# 构建与发布工作流
+# 触发：v* 标签推送 + 手动触发
+# 流程：test（vet + 单测）→ build-binary（5 平台交叉编译）
+#       → release（校验和 + GitHub Release，仅 tag 推送时执行）
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 同一 ref（tag）的并发运行互相取消：防 force-push 同 tag 或连续 dispatch 重叠构建
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BINARY_NAME: opencode2api-lite
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Go 1.26
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: true
+
+      - name: 静态检查
+        run: go vet ./...
+
+      - name: 运行测试
+        run: go test ./...
+
+  build-binary:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+          - os: linux
+            arch: arm64
+          - os: darwin
+            arch: amd64
+          - os: darwin
+            arch: arm64
+          - os: windows
+            arch: amd64
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Go 1.26
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: true
+
+      - name: 构建二进制
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          EXE=""
+          VERSION="${GITHUB_REF_NAME#v}"   # tag v1.0.0 → 1.0.0；手动触发无 tag 时为空
+          if [ -z "$VERSION" ]; then VERSION="dev"; fi
+          # 手动触发时 GITHUB_REF_NAME=分支名（可能含 /），会破坏产物文件名与 ldflags。
+          # 仅允许 [0-9A-Za-z._-]，否则回退 dev
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9A-Za-z._-]+$'; then VERSION="dev"; fi
+          if [ "$GOOS" = "windows" ]; then EXE=".exe"; fi
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags="-s -w -X main.version=${VERSION}" \
+            -o "dist/${BINARY_NAME}-${VERSION}-${GOOS}-${GOARCH}${EXE}" .
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: build-binary
+    # 仅 tag 推送时创建 Release；workflow_dispatch 手动触发时跳过
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码（gh release create 需要 git 上下文）
+        uses: actions/checkout@v4
+
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成校验和
+        run: |
+          cd dist
+          sha256sum * > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd dist
+          gh release create "$GITHUB_REF_NAME" $(find . -type f ! -name sha256sums.txt) --generate-notes

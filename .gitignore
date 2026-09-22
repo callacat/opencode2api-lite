@@ -1,0 +1,12 @@
+# 运行时生成（配置 / 用量统计，含端口与出口代理信息，不入库）
+config.json
+stats.json
+
+# 构建产物
+opencode2api-lite
+opencode2api-lite.exe
+dist/
+
+# 本地临时
+*.log
+.DS_Store
