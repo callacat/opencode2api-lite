@@ -100,26 +100,25 @@ func TestNewOCSessionIDDescending(t *testing.T) {
 		decoded = append(decoded, (v&0xFFFFFFFFFFFF)^0xFFFFFFFFFFFF)
 	}
 	// ts*0x1000 已经溢出 48 位（ts_ms≈1.79e12 × 4096 ≈ 7.3e15 > 2^48≈2.8e14），
-	// 所以前 12 位里的时间戳是**模 2^36 毫秒**的。2^36 ms ≈ 795 天，
-	// 也就是这套编码每 ~2.18 年回绕一次；反推时必须把回绕补回来。
-	const tsWrap = uint64(1) << 36
+	// 所以前 12 位里的时间戳是**模 2^36 毫秒**的。这套编码每 ~2.18 年回绕一次，
+	// 因此「距 now 多久」只能在模 2^36 的环上量，不能用线性加减还原。
+	// （先前按 now 线性加减还原的写法在 tsMod 越过 now%tsWrap 时会多减一次回绕，
+	//  反推出 now-2^36+k、差值 ≈2^36 而误报——生成 50 个 ID 只要跨过回绕
+	//  边界就会红，约 1/3 概率复现。）
+	const tsWrap = int64(1) << 36
+	nowMod := int64(now % uint64(tsWrap))
 	for i, d := range decoded {
-		tsMod := d >> 12
-		ts := tsMod + ((now-tsMod)/tsWrap+1)*tsWrap
-		if ts > now {
-			ts -= tsWrap
+		// 把 delta 归一化到 (-2^35, 2^35]：过半个周期就说明走的是反方向，补一个周期。
+		delta := int64(d>>12) - nowMod
+		if delta > tsWrap/2 {
+			delta -= tsWrap
+		} else if delta < -tsWrap/2 {
+			delta += tsWrap
 		}
-		// 反推出的时间戳必须落在「刚才这一小段时间窗」内。
 		// 容忍 ±60s：进程内时钟与用例读取时刻有差，且上游容忍度实测 ≥7 天。
-		var diff int64
-		if int64(ts) > int64(now) {
-			diff = int64(ts) - int64(now)
-		} else {
-			diff = int64(now) - int64(ts)
-		}
-		if diff > 60_000 {
-			t.Fatalf("第 %d 个 ID 反推出的时间戳 %d 距当前 %d 相差 %dms，不是 descending 编码（纯随机会长这样）",
-				i, ts, now, diff)
+		if diff := delta; diff > 60_000 || diff < -60_000 {
+			t.Fatalf("第 %d 个 ID 反推出的时间戳距当前 %dms（模 2^36 = %dms），不是 descending 编码（纯随机会长这样）",
+				i, diff, int64(d>>12))
 		}
 	}
 	// 同一毫秒内连续生成的 counter 必须递增，否则 value 会撞车。
