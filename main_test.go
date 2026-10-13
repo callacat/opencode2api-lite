@@ -291,3 +291,208 @@ func TestConfigPostDecodePresence(t *testing.T) {
 		t.Errorf("显式新值应原样解出，得到 %v", p)
 	}
 }
+
+// ======================== key_pool 多凭据轮转 ========================
+
+const testSession = "ses_ecbad4897ffe524uCAgXevWcMc"
+
+func testPool(strategy string, keys ...string) *KeyPoolConfig {
+	kp := &KeyPoolConfig{Enabled: true, Strategy: strategy}
+	for i, k := range keys {
+		kp.Keys = append(kp.Keys, KeyEntry{ID: "k" + string(rune('1'+i)), Key: k})
+	}
+	return kp
+}
+
+// authOf 走真实鉴权出口 buildOCRequest，取出 Authorization 头 —— 断言打在
+// 唯一那条出路上，而不是内部辅助函数，否则重构就测不到真东西。
+func authOf(t *testing.T) (auth, keyID string) {
+	t.Helper()
+	req, id, err := buildOCRequest(context.Background(), []byte(`{}`))
+	if err != nil {
+		t.Fatalf("构造上游请求失败: %v", err)
+	}
+	return req.Header.Get("Authorization"), id
+}
+
+// TestKeyPoolAuthFallsBackToPublic 是本卡最重要的一条防退化用例：
+// 未启用 / 池为空 / 池里没有可用凭据时，鉴权必须**逐字节**回到 Bearer public。
+// 悄悄改成别的东西 = 免费层直接退化成单凭据限流，且没有任何报错。
+func TestKeyPoolAuthFallsBackToPublic(t *testing.T) {
+	cases := []struct {
+		name string
+		kp   *KeyPoolConfig
+	}{
+		{"未配置 key_pool", nil},
+		{"启用但池为空", &KeyPoolConfig{Enabled: true, Strategy: "sticky"}},
+		{"停用但池里有凭据", &KeyPoolConfig{Enabled: false, Strategy: "sticky",
+			Keys: []KeyEntry{{ID: "k1", Key: "oc_sk_a"}}}},
+		{"停用且策略为轮转", &KeyPoolConfig{Enabled: false, Strategy: "round_robin",
+			Keys: []KeyEntry{{ID: "k1", Key: "oc_sk_a"}}}},
+		{"池里凭据全被 enabled:false 停用", &KeyPoolConfig{Enabled: true, Strategy: "sticky",
+			Keys: []KeyEntry{{ID: "k1", Key: "oc_sk_a", Enabled: boolPtr(false)}}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			applyConfig(AppConfig{OCSessionID: testSession, KeyPool: c.kp})
+			auth, keyID := authOf(t)
+			if auth != "Bearer public" {
+				t.Errorf("应回落到 Bearer public，得到 %q", auth)
+			}
+			if keyID != "" {
+				t.Errorf("未命中池时 keyID 应为空，得到 %q", keyID)
+			}
+		})
+	}
+	applyConfig(AppConfig{}) // 复位全局池，别漏给后面的用例
+}
+
+// TestKeyPoolAuthUsesPoolKey 钉住正向路径：启用且池非空时，鉴权头用的是池中
+// 凭据而不是 public，且 key_id 与该凭据的配置 id 对得上（运营靠它判断轮转）。
+func TestKeyPoolAuthUsesPoolKey(t *testing.T) {
+	kp := testPool("sticky", "oc_sk_pool_one", "oc_sk_pool_two")
+	applyConfig(AppConfig{OCSessionID: testSession, KeyPool: kp})
+	auth, keyID := authOf(t)
+	if auth != "Bearer oc_sk_pool_one" && auth != "Bearer oc_sk_pool_two" {
+		t.Errorf("应使用池内凭据，得到 %q", auth)
+	}
+	if keyID != "k1" && keyID != "k2" {
+		t.Errorf("key_id 应来自配置 id，得到 %q", keyID)
+	}
+	applyConfig(AppConfig{})
+}
+
+// TestKeyPoolStickyPinsSession 覆盖 issue 点名的语义：sticky 下同一会话连发多次
+// 必须命中同一个 key —— 中途换 key 会让上游当成新身份，可能反而多吃掉一份配额窗口。
+func TestKeyPoolStickyPinsSession(t *testing.T) {
+	applyConfig(AppConfig{OCSessionID: testSession,
+		KeyPool: testPool("sticky", "oc_sk_one", "oc_sk_two", "oc_sk_three")})
+	first, _ := authOf(t)
+	for i := 0; i < 5; i++ {
+		if got, _ := authOf(t); got != first {
+			t.Fatalf("sticky 下第 %d 次请求换了凭据：%q -> %q", i+2, first, got)
+		}
+	}
+	// 额度耗尽后必须换凭据，否则 sticky 会永久钉死在一条死 key 上
+	if next := advanceOCKey(testSession); next != "k2" {
+		t.Errorf("advance 后应换到 k2，得到 %q", next)
+	}
+	if got, _ := authOf(t); got == first {
+		t.Errorf("advance 之后应换凭据，仍是 %q", got)
+	}
+	applyConfig(AppConfig{})
+}
+
+// TestKeyPoolRoundRobinSpreads 轮转策略要把负载摊开，否则单条凭据先被打空。
+func TestKeyPoolRoundRobinSpreads(t *testing.T) {
+	applyConfig(AppConfig{OCSessionID: testSession,
+		KeyPool: testPool("round_robin", "oc_sk_one", "oc_sk_two", "oc_sk_three")})
+	seen := map[string]bool{}
+	for i := 0; i < 6; i++ {
+		auth, _ := authOf(t)
+		seen[auth] = true
+	}
+	if len(seen) != 3 {
+		t.Errorf("轮转应把 6 次请求摊到 3 条凭据上，实际用到 %d 条", len(seen))
+	}
+	applyConfig(AppConfig{})
+}
+
+// TestNormalizeKeyPool 归一化三件事：重复凭据只留一条（重复项不增加配额，
+// 只会白占轮转位 —— 现网 120 条里就有 34 条重复）、缺 id 按位置补 k1..kN、
+// 停用项剔除。现网配置后 86 条根本没有 id 字段，补号是诊断行能对上的前提。
+func TestNormalizeKeyPool(t *testing.T) {
+	kp := &KeyPoolConfig{Enabled: true, Keys: []KeyEntry{
+		{ID: "k1", Key: "oc_sk_dup"},
+		{Key: "oc_sk_dup"},                          // 重复
+		{Key: "oc_sk_b"},                            // 无 id → 按位置补
+		{Key: "oc_sk_off", Enabled: boolPtr(false)}, // 停用
+		{Key: "  oc_sk_c  "},                        // 带空白
+	}}
+	normalizeKeyPool(kp)
+	if kp.Strategy != "sticky" {
+		t.Errorf("策略缺省应为 sticky，得到 %q", kp.Strategy)
+	}
+	if kp.MaxRetries != keyPoolDefaultRetries {
+		t.Errorf("max_retries 缺省应为 %d，得到 %d", keyPoolDefaultRetries, kp.MaxRetries)
+	}
+	var ids, keys []string
+	for _, k := range kp.Keys {
+		ids = append(ids, k.ID)
+		keys = append(keys, k.Key)
+	}
+	if got, want := strings.Join(ids, ","), "k1,k3,k5"; got != want {
+		t.Errorf("去重/补号后 id 序列 = %q，期望 %q（k2 重复、k4 停用应被剔除）", got, want)
+	}
+	if got, want := strings.Join(keys, ","), "oc_sk_dup,oc_sk_b,oc_sk_c"; got != want {
+		t.Errorf("凭据序列 = %q，期望 %q（空白应被裁掉）", got, want)
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+// TestKeyPoolPlainStringShorthand 兼容老容器 config.example.json 记录的写法：
+// keys 里可以直接写字符串，不必包成 {"key": ...}。
+func TestKeyPoolPlainStringShorthand(t *testing.T) {
+	var kp KeyPoolConfig
+	if err := json.Unmarshal([]byte(`{"enabled":true,"keys":["oc_sk_a",{"id":"named","key":"oc_sk_b"}]}`), &kp); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	normalizeKeyPool(&kp)
+	if len(kp.Keys) != 2 {
+		t.Fatalf("应解出 2 条凭据，得到 %d", len(kp.Keys))
+	}
+	if kp.Keys[0].Key != "oc_sk_a" || kp.Keys[0].ID != "k1" {
+		t.Errorf("字符串简写应补成 {key, id:k1}，得到 %+v", kp.Keys[0])
+	}
+	if kp.Keys[1].ID != "named" {
+		t.Errorf("显式 id 应保留，得到 %q", kp.Keys[1].ID)
+	}
+}
+
+// TestConfigPostPreservesKeyPool 钉住面板保存不清空凭据池：面板没有 key 管理 UI，
+// 回传体里不会有 key_pool，解码必须能区分「键缺失」与「显式给出」，
+// 缺失时 handler 沿用现值 —— 否则运营点一次保存就把整池凭据静默清空。
+func TestConfigPostPreservesKeyPool(t *testing.T) {
+	decode := func(body string) *KeyPoolConfig {
+		var b struct {
+			AppConfig
+			KeyPool *KeyPoolConfig `json:"key_pool"`
+		}
+		if err := json.Unmarshal([]byte(body), &b); err != nil {
+			t.Fatalf("解析失败: %v", err)
+		}
+		return b.KeyPool
+	}
+	if p := decode(`{"model_alias":{}}`); p != nil {
+		t.Errorf("键缺失时应得 nil（handler 据此沿用现值），得到 %+v", p)
+	}
+	p := decode(`{"key_pool":{"enabled":false,"keys":[]}}`)
+	if p == nil || p.Enabled {
+		t.Errorf("显式给出应解出且能表达「停用」，得到 %+v", p)
+	}
+	p = decode(`{"key_pool":{"enabled":true,"keys":["oc_sk_x"]}}`)
+	if p == nil || !p.Enabled || len(p.Keys) != 1 {
+		t.Errorf("显式给出应原样解出，得到 %+v", p)
+	}
+}
+
+// TestKeyPoolExtraAttemptsBound 换凭据的重试次数要有上界：池大不等于可以无限试，
+// 每一次 429 重试都要等一个上游往返，放开会把首字节延迟拖到分钟级。
+func TestKeyPoolExtraAttemptsBound(t *testing.T) {
+	applyConfig(AppConfig{OCSessionID: testSession, KeyPool: testPool("sticky", "oc_sk_a", "oc_sk_b")})
+	if got := keyPoolExtraAttempts(); got != 1 {
+		t.Errorf("2 条凭据最多换 1 次，得到 %d", got)
+	}
+	applyConfig(AppConfig{OCSessionID: testSession, KeyPool: testPool("sticky", "oc_sk_a")})
+	if got := keyPoolExtraAttempts(); got != 0 {
+		t.Errorf("只有 1 条凭据时不应换键，得到 %d", got)
+	}
+	// 6 条凭据时 max_retries=4 才是约束（否则 n-1 才是约束，见上一断言）
+	applyConfig(AppConfig{OCSessionID: testSession, KeyPool: testPool("sticky",
+		"oc_sk_a", "oc_sk_b", "oc_sk_c", "oc_sk_d", "oc_sk_e", "oc_sk_f")})
+	if got := keyPoolExtraAttempts(); got != keyPoolDefaultRetries {
+		t.Errorf("凭据多于 max_retries 时应取 max_retries=%d，得到 %d", keyPoolDefaultRetries, got)
+	}
+	applyConfig(AppConfig{})
+}

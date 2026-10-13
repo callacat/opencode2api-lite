@@ -2,6 +2,35 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- **key_pool 多凭据轮转**：恢复上游 fork 重写时丢掉的凭据池能力。免费层限流维度实测为
+  **（模型 × 凭据）**，单凭据的日预算就是整条链路的日预算；此前鉴权写死 `Bearer public`，
+  等于把凭据维度钉死在 1，`429 FreeUsageLimitError` 无从消除。配置新增 `key_pool`
+  （`enabled` / `strategy` / `max_retries` / `keys`），由 `buildOCRequest` 这唯一鉴权出口选凭据。
+  - `strategy` 支持 `sticky`（按 `x-session-id` 粘住一个凭据，中途不换——每次换凭据上游都当
+    新身份，可能反而多吃掉一份配额窗口）与 `round_robin`（每个请求推进游标，把负载摊到全池）。
+  - 凭据额度耗尽（HTTP 429）时自动换下一条重试，上限 `max_retries`（默认 4）。
+    **按状态码判定而不是匹配错误文案**：实测 49 条耗尽凭据里 45 条返回的是
+    `{"error":{"type":"server_error","message":"...Endpoint is unavailable."}}`，
+    只有 1 条是 `FreeUsageLimitError`，只认文案会漏掉绝大多数耗尽信号。
+  - **未启用 / 池空 / 池内无启用凭据时一律回落到 `Bearer public`**，鉴权头与引入本字段之前
+    逐字节一致，未配置 `key_pool` 的部署行为不变。
+  - 面板保存配置时若请求体未带 `key_pool`，沿用现值而非清空：面板没有 key 管理 UI，
+    不做「省略即沿用」的话运营点一次保存就会把整池凭据静默清空（与 v1.0.0 修过的
+    `oc_session_id` 同一类问题）。
+  - 诊断：429 日志行新增 `key_id=` 与 `next_key_id=`（对应老容器的 `msg=upstream_attempt ...
+    key_id=kNN`），启用凭据池时另在启动与热更时打一行凭据数/策略，运营只凭日志即可确认轮转在工作。
+- `keys` 条目兼容老容器 `config.example.json` 记录的两种写法：完整对象，或直接写字符串。
+  缺 `id` 的条目按数组位置补 `k1..kN`（老容器的 `key_id` 就是位置号）。
+  重复凭据在加载时去重——同一凭据出现两次不会多拿一份配额，只会白占轮转位。
+- 自检 11 → 19 个用例。最关键的一条是 `TestKeyPoolAuthFallsBackToPublic`：
+  5 种未启用/空池/全停用形态下鉴权头必须仍是 `Bearer public`，守住「不配 key_pool 就完全不变」
+  这条底线。其余覆盖 sticky 粘住、轮转摊开、归一化去重补号、字符串简写、面板省略即沿用、
+  重试次数上界。
+
 ## [v1.0.2] - 2026-10-13
 
 ### 修复

@@ -19,5 +19,14 @@
       "name": "local"
     }
   ],
-  "active_socks5": ""
+  "active_socks5": "",
+  "key_pool": {
+    "enabled": false,
+    "strategy": "sticky",
+    "max_retries": 4,
+    "keys": [
+      {"id": "k1", "key": "oc_sk_000000000000_placeholder-1"},
+      "oc_sk_000000000000_placeholder-2"
+    ]
+  }
 }

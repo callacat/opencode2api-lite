@@ -96,6 +96,7 @@ curl -s http://127.0.0.1:8000/v1/messages \
 | `active_socks5` | 出口选择：`""` 直连；`"127.0.0.1:7890"` 指定代理；`"__round_robin__"` 每请求轮询；`"__rate_limit_switch__"` 遇 429 轮换（含直连）；`"__rate_limit_switch_no_direct__"` 同上但只用代理 |
 | `oc_session_id` | 免费层必需的**真实会话 ID**（`ses_` 开头 + 26 位）。上游 2026-10 起校验会话存在性，编造的 `ses_*` 一律 403；未配置时代理返回 `503 OCSessionMissing`（而不是静默 403）。也可用环境变量 `OC_SESSION_ID` 注入。**注意：会话有效并不等于能过**——请求体的 `tools` 还必须同时含 `bash` 与 `read`（缺任一同样 403，由代理自动补齐，勿在客户端精简掉）。两道门都失效时，上游只回一个不区分来源的 `403 FreeTierError` |
 | `oc_session_refresh_cmd` | 可选。定期执行的命令，从其输出里解析新的 `ses_*` 自动续命（默认每 30 分钟，`OC_SESSION_REFRESH_INTERVAL` 可调）。上游无匿名会话注册端点，会话只能由 OpenCode 客户端产生，有效期未公开量化 |
+| `key_pool` | 可选，多凭据轮转。免费层限流维度是**（模型 × 凭据）**，单凭据的日预算就是整条链路的日预算，配上池子才能把总额度按凭据数放大。`enabled` 关闭 / `keys` 为空时鉴权回落到 `Bearer public`，行为与不配这一项完全一致。`strategy`：`sticky`（默认，按 `x-session-id` 粘住一条，中途不换）或 `round_robin`（每请求推进游标摊开负载）。`max_retries` 是凭据额度耗尽（429）后额外换几条重试，默认 4。`keys` 每条可写 `{"id","key","weight","enabled"}` 或直接写字符串；缺 `id` 按数组位置补 `k1..kN`，重复凭据加载时去重。凭据属敏感信息，不要提交进仓库 |
 
 ## HTTP 接口
 

@@ -1051,6 +1051,223 @@ type AppConfig struct {
 	// 出新的 ses_* 并写回配置，用于会话过期后自动续命（有效期下限实测 ≥52 分钟，
 	// 上限未知）。留空则只用 OCSessionID，不自动续。
 	OCSessionRefreshCmd string `json:"oc_session_refresh_cmd,omitempty"`
+
+	// KeyPool 是上游凭据池。免费层限流维度实测为（模型 × 凭据）而非 IP / 会话，
+	// 单凭据的日预算就是整条链路的日预算；把凭据维度扩回多值才能放大总额度。
+	// 未启用或池为空时鉴权回落到 Bearer public，行为与本字段引入前完全一致。
+	KeyPool *KeyPoolConfig `json:"key_pool,omitempty"`
+}
+
+// ======================== key_pool（多凭据轮转） ========================
+
+// KeyEntry 是池中的一条凭据。兼容老容器 config.example.json 记录的两种写法：
+// 完整对象，或直接写一个字符串（UnmarshalJSON 补成 {"key": ...}）。
+// id 缺省时由 normalizeKeyPool 按数组位置补 k1..kN —— 老容器日志里的 key_id=k82
+// 就是位置号，而现网那 120 条里有 86 条根本没有 id 字段，不补号诊断行对不上。
+type KeyEntry struct {
+	ID      string `json:"id,omitempty"`
+	Key     string `json:"key"`
+	Weight  int    `json:"weight,omitempty"`
+	Enabled *bool  `json:"enabled,omitempty"`
+}
+
+func (e *KeyEntry) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		e.Key = strings.TrimSpace(s)
+		return nil
+	}
+	type plain KeyEntry // 别名类型，避免 UnmarshalJSON 自我递归
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	*e = KeyEntry(p)
+	e.Key = strings.TrimSpace(e.Key)
+	e.ID = strings.TrimSpace(e.ID)
+	return nil
+}
+
+// KeyPoolConfig 对齐老容器 key_pool 的语义，只取本卡需要的子集。
+// 老容器还有 max_retries / retry_on / cooldown_secs / blacklist_after，
+// 这里保留 max_retries（换凭据的校准旋钮），其余属于冷却/黑名单状态机，不做。
+type KeyPoolConfig struct {
+	Enabled    bool       `json:"enabled"`
+	Strategy   string     `json:"strategy,omitempty"` // sticky（默认）| round_robin
+	MaxRetries int        `json:"max_retries,omitempty"`
+	Keys       []KeyEntry `json:"keys,omitempty"`
+}
+
+const (
+	keyStrategySticky     = "sticky"
+	keyStrategyRoundRobin = "round_robin"
+	// keyPoolDefaultRetries 是「凭据额度耗尽后额外换几个 key」的上限。取 4 是折中：
+	// 现网 86 个凭据里 37 个有额度时，4 次内命中活凭据的概率约 89%，8 次约 97%；
+	// 而每次 429 重试都要等一个上游往返，太多会把首字节延迟拖到分钟级。
+	// 现网实测偏紧时调大 config 的 key_pool.max_retries 即可，不用改代码。
+	keyPoolDefaultRetries = 4
+)
+
+// normalizeKeyPool 归一化凭据池：补位置 id、剔除停用/空值、按凭据值去重。
+// 去重是有实际收益的 —— 同一凭据在池里出现两次不会多拿到一份配额，
+// 只会把轮转位白占一半（现网 120 条里就有 34 条是重复项）。
+func normalizeKeyPool(kp *KeyPoolConfig) {
+	if kp == nil {
+		return
+	}
+	kp.Strategy = strings.TrimSpace(kp.Strategy)
+	if kp.Strategy == "" {
+		kp.Strategy = keyStrategySticky
+	}
+	if kp.MaxRetries <= 0 {
+		kp.MaxRetries = keyPoolDefaultRetries
+	}
+	seen := make(map[string]bool, len(kp.Keys))
+	out := make([]KeyEntry, 0, len(kp.Keys))
+	for i, k := range kp.Keys {
+		k.Key = strings.TrimSpace(k.Key)
+		if k.Key == "" {
+			continue
+		}
+		if k.Enabled != nil && !*k.Enabled {
+			continue
+		}
+		if seen[k.Key] {
+			continue
+		}
+		seen[k.Key] = true
+		k.ID = strings.TrimSpace(k.ID)
+		if k.ID == "" {
+			k.ID = fmt.Sprintf("k%d", i+1)
+		}
+		out = append(out, k)
+	}
+	kp.Keys = out
+}
+
+// ocKey 是一条归一化后可用的凭据。val 只进 Authorization 头，不进任何日志。
+type ocKey struct {
+	id  string
+	val string
+}
+
+// ocKeys 是生效中的凭据池与轮转游标。零值即「未启用」，所有取值都回落到 public。
+var ocKeys struct {
+	mu       sync.Mutex
+	keys     []ocKey
+	strategy string
+	retries  int
+	sticky   map[string]int
+	rr       int
+	// cfg 是归一化后的池子副本，只给 /api/config 的 GET 回读用（面板要能确认
+	// 线上到底挂着哪些凭据）。存副本而不是指针，避免与并发保存的数据竞争。
+	cfg KeyPoolConfig
+}
+
+// currentKeyPool 返回当前生效池的副本，供面板回传时「省略即沿用」用。
+func currentKeyPool() *KeyPoolConfig {
+	ocKeys.mu.Lock()
+	defer ocKeys.mu.Unlock()
+	cp := ocKeys.cfg
+	cp.Keys = append([]KeyEntry(nil), ocKeys.cfg.Keys...)
+	return &cp
+}
+
+// installKeyPool 装载生效中的凭据池并打一行启动日志 —— 运营不必翻配置文件
+// 就能确认池子到底挂上了几个、用的什么策略。
+func installKeyPool(kp *KeyPoolConfig) {
+	var live []ocKey
+	strategy := keyStrategySticky
+	retries := keyPoolDefaultRetries
+	stored := KeyPoolConfig{Strategy: keyStrategySticky, MaxRetries: keyPoolDefaultRetries}
+	if kp != nil {
+		// 在这里归一化而不是指望调用方：loadConfig / 面板 POST / 未来的热更入口
+		// 未必都先走过 normalizeConfig。漏归一化的后果很隐蔽 ——
+		// max_retries=0 会让 429 换凭据的重试次数算成 0，整个轮转机制静默失效，
+		// 而日志里「凭据数=N」看着一切正常。
+		normalized := *kp
+		normalizeKeyPool(&normalized)
+		stored = normalized
+		strategy = normalized.Strategy
+		retries = normalized.MaxRetries
+		if normalized.Enabled {
+			for _, k := range normalized.Keys {
+				live = append(live, ocKey{id: k.ID, val: k.Key})
+			}
+		}
+	}
+	ocKeys.mu.Lock()
+	ocKeys.keys = live
+	ocKeys.strategy = strategy
+	ocKeys.retries = retries
+	ocKeys.sticky = make(map[string]int, 8)
+	ocKeys.rr = 0
+	ocKeys.cfg = stored
+	ocKeys.mu.Unlock()
+	if len(live) > 0 {
+		log.Printf("key_pool: 生效中，凭据数=%d strategy=%s max_retries=%d", len(live), strategy, retries)
+		return
+	}
+	log.Printf("key_pool: 未启用或池为空，鉴权回落到 Bearer public")
+}
+
+// keyPoolSize 返回生效凭据数。
+func keyPoolSize() int {
+	ocKeys.mu.Lock()
+	defer ocKeys.mu.Unlock()
+	return len(ocKeys.keys)
+}
+
+// keyPoolExtraAttempts 返回「额度耗尽后允许多试几轮」。
+// 池内还有 n 个凭据时最多换 min(max_retries, n-1) 次，总尝试数 = 1 + 它。
+func keyPoolExtraAttempts() int {
+	ocKeys.mu.Lock()
+	defer ocKeys.mu.Unlock()
+	n := len(ocKeys.keys)
+	if n <= 1 {
+		return 0
+	}
+	if ocKeys.retries > n-1 {
+		return n - 1
+	}
+	return ocKeys.retries
+}
+
+// pickOCKey 选出本次上游请求该用的凭据。
+// sticky：按 x-session-id 粘住一个 key，中途不换（每次换 key 上游都当新身份，
+// 可能白吃掉一份配额窗口），直到它 429 被 advanceOCKey 挪走。
+// round_robin：每个请求推进一次游标，把负载摊到全部凭据上。
+// 会话与凭据是两条独立的线：实测同一个 ses_* 配不同 oc_sk_ 都能过上游两道门，
+// 所以不需要为每个 key 单独注册会话。
+func pickOCKey(session string) (ocKey, bool) {
+	ocKeys.mu.Lock()
+	defer ocKeys.mu.Unlock()
+	n := len(ocKeys.keys)
+	if n == 0 {
+		return ocKey{}, false
+	}
+	idx := 0
+	if ocKeys.strategy == keyStrategyRoundRobin {
+		idx = ocKeys.rr % n
+		ocKeys.rr++
+	} else {
+		idx = ocKeys.sticky[session] % n
+	}
+	return ocKeys.keys[idx], true
+}
+
+// advanceOCKey 把会话从已耗尽的凭据上挪开，返回换到的 key id（池空则空串）。
+// round_robin 不用动：pick 的游标在失败那轮已经 +1，下一次 pick 必然换凭据。
+func advanceOCKey(session string) string {
+	ocKeys.mu.Lock()
+	defer ocKeys.mu.Unlock()
+	n := len(ocKeys.keys)
+	if n <= 1 || ocKeys.strategy == keyStrategyRoundRobin {
+		return ""
+	}
+	nxt := (ocKeys.sticky[session]%n + 1) % n
+	ocKeys.sticky[session] = nxt
+	return ocKeys.keys[nxt].id
 }
 
 // ======================== Claude Messages API 类型 ========================
@@ -1183,6 +1400,7 @@ func normalizeConfig(cfg *AppConfig) {
 	}
 	cfg.OCSessionID = strings.TrimSpace(cfg.OCSessionID)
 	cfg.OCSessionRefreshCmd = strings.TrimSpace(cfg.OCSessionRefreshCmd)
+	normalizeKeyPool(cfg.KeyPool)
 }
 
 func saveConfig(path string, cfg AppConfig) error {
@@ -1209,6 +1427,8 @@ func applyConfig(cfg AppConfig) {
 		// 面板改会话后立即生效，无需重启：把已初始化的会话也换掉。
 		ocSessionID = ocInjectedSession
 	}
+	// 凭据池同理热更：面板存一次配置就生效，不必重启容器。
+	installKeyPool(cfg.KeyPool)
 
 	socks5Mu.Lock()
 	proxiesUpdated := false
@@ -2225,13 +2445,20 @@ func convertResponse(data []byte, modelID string) ([]byte, error) {
 
 // buildOCRequest 用已经序列化好的请求体构造上游请求。
 // 每次重试都会重新 NewRequest（bytes.Reader 游标独立），但不再重新 Marshal 整个 body。
-func buildOCRequest(ctx context.Context, bodyBytes []byte) (*http.Request, error) {
+// 第二个返回值是本次用掉的凭据编号 key_id，只进诊断日志，绝不含凭据明文。
+func buildOCRequest(ctx context.Context, bodyBytes []byte) (*http.Request, string, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://opencode.ai/zen/v1/chat/completions", bytes.NewReader(bodyBytes))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer public")
+	// key_pool 命中就用池内凭据；未启用或池空一律回落到 Bearer public，
+	// 保证没配 key_pool 的部署行为与引入本字段之前逐字节一致。
+	auth, keyID := "public", ""
+	if k, ok := pickOCKey(ocCurrentSessionID()); ok {
+		auth, keyID = k.val, k.id
+	}
+	req.Header.Set("Authorization", "Bearer "+auth)
 	req.Header.Set("User-Agent", fmt.Sprintf("opencode/%s ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14", ocClientVer))
 	// 2026-10 上游把 x-session-id 的校验从「格式」改成「会话是否真实存在」：
 	// 编造的 ses_* 一律 403 FreeTierError，真实 API key 与新协议头都救不了。
@@ -2241,7 +2468,7 @@ func buildOCRequest(ctx context.Context, bodyBytes []byte) (*http.Request, error
 	req.Header.Set("x-session-id", sid)
 	req.Header.Set("x-session-affinity", sid)
 	req.Header.Set("Accept", "application/json")
-	return req, nil
+	return req, keyID, nil
 }
 
 // aggregateOpenAIStream 把上游强制 stream:true 返回的 OpenAI SSE 流聚合为
@@ -2424,10 +2651,15 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 	var lastStatus int
 	var lastHeader http.Header
 	attempts := socks5RateLimitAttemptCount()
-	// 这个循环只服务两类重试：429 换出口重试、Tor 电路故障 / 网络层错误重试。
+	// 池内还有别的凭据时，429 也要允许多试几轮 —— 单凭据的额度用完是常态，
+	// 换凭据才是 key_pool 存在的意义。
+	if extra := keyPoolExtraAttempts(); extra > 0 && attempts < extra+1 {
+		attempts = extra + 1
+	}
+	// 这个循环只服务两类重试：429 换出口/换凭据重试、Tor 电路故障 / 网络层错误重试。
 	// 5xx 已不再重试 —— 直接走下面的透传分支，把上游状态码与错误体原样交给客户端。
 	for attempt := 0; ; {
-		up, err := buildOCRequest(ctx, bodyBytes)
+		up, keyID, err := buildOCRequest(ctx, bodyBytes)
 		if err != nil {
 			lastErr = err
 			break
@@ -2460,12 +2692,18 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 				// 聚合为完整 chat.completion JSON 还原客户端要的非流式响应。
 				b = aggregateOpenAIStream(b, modelID)
 			}
+			if debugMode && keyID != "" {
+				log.Printf("%s[upstream ok] model=%s key_id=%s exit=%s status=%d", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode)
+			}
 			return b, resp.StatusCode, resp.Header, nil
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusTooManyRequests {
-			log.Printf("%s[upstream rate limited] model=%s exit=%s status=%d retry_after=%q body=%s", labelPrefix(ctx), modelID, selection.Label, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
+			// key_id 打进这行是刻意的：运营要能只凭日志确认轮转真的在工作
+			// （老容器对应的是 msg=upstream_attempt ... key_id=k82）。
+			nextKey := advanceOCKey(ocCurrentSessionID())
+			log.Printf("%s[upstream rate limited] model=%s key_id=%s exit=%s status=%d retry_after=%q next_key_id=%s body=%s", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode, resp.Header.Get("Retry-After"), nextKey, string(errBody))
 			lastBody = errBody
 			lastStatus = resp.StatusCode
 			lastHeader = resp.Header.Clone()
@@ -2509,10 +2747,13 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 	}
 
 	attempts := socks5RateLimitAttemptCount()
-	// 这个循环只服务两类重试：429 换出口重试、Tor 电路故障 / 网络层错误重试。
+	if extra := keyPoolExtraAttempts(); extra > 0 && attempts < extra+1 {
+		attempts = extra + 1
+	}
+	// 这个循环只服务两类重试：429 换出口/换凭据重试、Tor 电路故障 / 网络层错误重试。
 	// 5xx 已不再重试 —— 直接走下面的透传分支，把上游状态码与错误体原样交给客户端。
 	for attempt := 0; ; {
-		up, err := buildOCRequest(ctx, bodyBytes)
+		up, keyID, err := buildOCRequest(ctx, bodyBytes)
 		if err != nil {
 			break
 		}
@@ -2531,12 +2772,16 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if debugMode && keyID != "" {
+				log.Printf("%s[upstream ok] model=%s key_id=%s exit=%s status=%d", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode)
+			}
 			return resp.Body, resp.StatusCode, resp.Header, nil
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusTooManyRequests {
-			log.Printf("%s[upstream rate limited] model=%s exit=%s status=%d retry_after=%q body=%s", labelPrefix(ctx), modelID, selection.Label, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
+			nextKey := advanceOCKey(ocCurrentSessionID())
+			log.Printf("%s[upstream rate limited] model=%s key_id=%s exit=%s status=%d retry_after=%q next_key_id=%s body=%s", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode, resp.Header.Get("Retry-After"), nextKey, string(errBody))
 			rotateSocks5OnRateLimit(ctx)
 			if attempt < attempts {
 				continue
@@ -5186,6 +5431,11 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		cfg.Socks5Proxies = socks5Proxies
 		cfg.ActiveSocks5 = activeSocks5
 		socks5Mu.RUnlock()
+		// 凭据池原样回读：面板没有 key 管理 UI，但运营要能从 /api/config
+		// 确认线上池子的规模与策略（这也是本卡的验收判据之一）。
+		if kp := currentKeyPool(); kp != nil {
+			cfg.KeyPool = kp
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(cfg)
 	case http.MethodPost:
@@ -5195,6 +5445,10 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			AppConfig
 			OCSessionID *string `json:"oc_session_id"`
+			// 同理：面板没有 key 管理 UI，回传体里不会有 key_pool。
+			// 不做「省略即沿用」的话，运营在面板点一次保存就会把整池凭据
+			// 静默清空 —— 免费层随即退化成单凭据，正是本卡要修的那个退化。
+			KeyPool *KeyPoolConfig `json:"key_pool"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, `{"error":"Invalid JSON"}`, http.StatusBadRequest)
@@ -5207,6 +5461,11 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			return ""
 		}())
+		if body.KeyPool != nil {
+			cfg.KeyPool = body.KeyPool
+		} else {
+			cfg.KeyPool = currentKeyPool()
+		}
 		normalizeConfig(&cfg)
 		if err := saveConfig(configPath, cfg); err != nil {
 			http.Error(w, `{"error":"Failed to save config"}`, http.StatusInternalServerError)
