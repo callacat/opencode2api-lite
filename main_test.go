@@ -3,11 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"io"
-	"net/http"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestCompareVersion 覆盖上游版本门槛判定：UA 里的 opencode/<version> 低于
@@ -39,9 +39,10 @@ func TestNormalizeOCVersion(t *testing.T) {
 	}
 }
 
-// TestOCSessionInjection 钉住 2026-10 上游改会话存在性校验后的选取契约：
-// 注入的真实会话被原样使用；未注入时**不编造**（返回空串，由 callOpenCodeAPI 转 503），
-// 因为编造值必然 403 FreeTierError，而 403 对调用方毫无信息量。
+// TestOCSessionInjection 钉住会话选取契约：配了 oc_session_id 就用配置值
+// （固定会话对「会话 sticky」有独立价值，且已上线，不退回去）；
+// 没配则自动生成反转时间戳会话——上游校验的是 ID 的时间戳结构而非「谁签发过」，
+// 自动生成即可过门，不再 503。
 func TestOCSessionInjection(t *testing.T) {
 	const real = "ses_ecbad4897ffe524uCAgXevWcMc"
 
@@ -57,27 +58,74 @@ func TestOCSessionInjection(t *testing.T) {
 	if hasInjectedOCSession() {
 		t.Error("清空注入后 hasInjectedOCSession 应为 false")
 	}
-	if got := ocCurrentSessionID(); got != "" {
-		t.Errorf("未注入时不应编造会话（会必然 403），得到 %q", got)
+	generated := ocCurrentSessionID()
+	if generated == "" {
+		t.Fatal("未注入时应自动生成会话，不应返回空串（旧行为是 503）")
+	}
+	if !ocSessionRe.MatchString(generated) {
+		t.Errorf("自动生成的会话应符合 ses_+26 位格式，得到 %q", generated)
+	}
+	// 进程内稳定：同一进程反复取应拿到同一个，避免每请求换一个身份
+	if again := ocCurrentSessionID(); again != generated {
+		t.Errorf("自动生成的会话应在进程内稳定，得到 %q 与 %q 不一致", again, generated)
 	}
 }
 
-// TestOCSessionMissingBody 确认 503 响应体可读：调用方要能一眼看出该配什么。
-func TestOCSessionMissingBody(t *testing.T) {
-	var resp struct {
-		Error struct {
-			Type    string `json:"type"`
-			Message string `json:"message"`
-		} `json:"error"`
+// TestNewOCSessionIDShape 断言生成值匹配 ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$ ——
+// 纯随机也能通过这条形状正则，所以它只是及格线，不是判据本身。
+func TestNewOCSessionIDShape(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		got := newOCSessionID()
+		if !ocSessionRe.MatchString(got) {
+			t.Fatalf("第 %d 次生成不符合形状: %q", i, got)
+		}
 	}
-	if err := json.Unmarshal(ocSessionMissingBody(), &resp); err != nil {
-		t.Fatalf("503 响应体不是合法 JSON: %v", err)
+}
+
+// TestNewOCSessionIDDescending 是防退化的关键判据：前 12 位 hex 必须带
+// 反转时间戳结构 —— 即 ^(ts_ms*0x1000+counter) 的低 48 位。
+// 只断言形状正则的话，把实现换回纯随机照样全绿，而线上会全量 403。
+func TestNewOCSessionIDDescending(t *testing.T) {
+	// 取当前毫秒基准：生成值的前 12 位应当反推回一个「最近的」时间戳。
+	now := uint64(time.Now().UnixMilli())
+	var decoded []uint64
+	for i := 0; i < 50; i++ {
+		id := newOCSessionID()
+		var v uint64
+		if _, err := fmt.Sscanf(id[4:16], "%012x", &v); err != nil {
+			t.Fatalf("前 12 位不是 hex: %q", id)
+		}
+		// 上游取的是 ^(ts*0x1000+counter) 的**低 48 位**，反推也必须在 48 位宽度内
+		// 取反补回来；直接对 64 位取反会把高 16 位补成 1，ts 全是垃圾。
+		decoded = append(decoded, (v&0xFFFFFFFFFFFF)^0xFFFFFFFFFFFF)
 	}
-	if resp.Error.Type != "OCSessionMissing" {
-		t.Errorf("错误类型 = %q, 期望 OCSessionMissing", resp.Error.Type)
+	// ts*0x1000 已经溢出 48 位（ts_ms≈1.79e12 × 4096 ≈ 7.3e15 > 2^48≈2.8e14），
+	// 所以前 12 位里的时间戳是**模 2^36 毫秒**的。2^36 ms ≈ 795 天，
+	// 也就是这套编码每 ~2.18 年回绕一次；反推时必须把回绕补回来。
+	const tsWrap = uint64(1) << 36
+	for i, d := range decoded {
+		tsMod := d >> 12
+		ts := tsMod + ((now-tsMod)/tsWrap+1)*tsWrap
+		if ts > now {
+			ts -= tsWrap
+		}
+		// 反推出的时间戳必须落在「刚才这一小段时间窗」内。
+		// 容忍 ±60s：进程内时钟与用例读取时刻有差，且上游容忍度实测 ≥7 天。
+		var diff int64
+		if int64(ts) > int64(now) {
+			diff = int64(ts) - int64(now)
+		} else {
+			diff = int64(now) - int64(ts)
+		}
+		if diff > 60_000 {
+			t.Fatalf("第 %d 个 ID 反推出的时间戳 %d 距当前 %d 相差 %dms，不是 descending 编码（纯随机会长这样）",
+				i, ts, now, diff)
+		}
 	}
-	if !strings.Contains(resp.Error.Message, "oc_session_id") {
-		t.Errorf("错误信息应点名要配的字段，得到 %q", resp.Error.Message)
+	// 同一毫秒内连续生成的 counter 必须递增，否则 value 会撞车。
+	first, second := newOCSessionID(), newOCSessionID()
+	if first[:16] == second[:16] {
+		t.Errorf("连续两次生成的前 12 位完全相同（%s），counter 未生效", first[:16])
 	}
 }
 
@@ -223,48 +271,6 @@ func TestFreeTierToolsGate(t *testing.T) {
 				t.Errorf("%s: 补齐后丢了客户端原有工具 %q，实际 %v", c.name, k, got)
 			}
 		}
-	}
-}
-
-// TestSessionGuardBothEntryPoints 钉住「未配置真实会话就不打上游」这条契约在**两个**入口都成立。
-//
-// 曾经只有非流式入口有这道闸口，流式请求会退回编造会话、静默拿到 403 FreeTierError，
-// 运维看到 403 会误判成「会话过期」，排查方向被带偏。
-func TestSessionGuardBothEntryPoints(t *testing.T) {
-	// 预置 sync.Once，跳过 initOCSession 里的版本探测网络请求，让用例纯离线。
-	ocOnce.Do(func() {})
-
-	applyConfig(AppConfig{})
-	defer applyConfig(AppConfig{})
-
-	body, status, _, err := callOpenCodeAPI(context.Background(), map[string]any{}, "big-pickle")
-	assertMissing := func(what string, body []byte, status int, err error) {
-		t.Helper()
-		if err == nil {
-			t.Errorf("%s: 未配置会话时应返回错误", what)
-		}
-		if status != http.StatusServiceUnavailable {
-			t.Errorf("%s: 状态码 = %d, 期望 503", what, status)
-		}
-		if !strings.Contains(string(body), "OCSessionMissing") {
-			t.Errorf("%s: 响应体应含 OCSessionMissing，得到 %q", what, string(body))
-		}
-	}
-	assertMissing("非流式入口", body, status, err)
-
-	stream, sStatus, _, sErr := callOpenCodeAPIStream(context.Background(), map[string]any{}, "big-pickle")
-	if stream != nil {
-		defer stream.Close()
-		got, _ := io.ReadAll(stream)
-		assertMissing("流式入口", got, sStatus, sErr)
-	} else {
-		t.Fatal("流式入口未配置会话时应返回非 nil 的响应体")
-	}
-
-	// 配了真实会话后闸口必须放行（否则修复过头，把正常请求也挡了）
-	applyConfig(AppConfig{OCSessionID: "ses_ecbad4897ffe524uCAgXevWcMc"})
-	if b, err := ocSessionGuard(); err != nil || b != nil {
-		t.Errorf("已配置会话时闸口应放行，得到 body=%s err=%v", string(b), err)
 	}
 }
 

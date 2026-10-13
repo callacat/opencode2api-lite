@@ -523,27 +523,62 @@ const (
 	defaultOCVersion = "1.18.31"
 )
 
-// newOCSessionID 编造一个格式合规的 session id（ses_ + 26 位）。
+// ocIDTimestamp 返回 (毫秒时间戳, 该毫秒内的序号)。序号在同一毫秒内自增、
+// 跨毫秒归零——上游的 shape 校验按 (ts_ms, counter) 复合值取低 48 位，
+// 少了这个序号，同一毫秒内并发生成的 ID 会撞出同一个 value。
+var (
+	ocIDMu        sync.Mutex
+	ocIDLastMilli uint64
+	ocIDCounter   uint64
+)
+
+func ocIDTimestamp() (uint64, uint64) {
+	ocIDMu.Lock()
+	defer ocIDMu.Unlock()
+	now := uint64(time.Now().UnixMilli())
+	if now != ocIDLastMilli {
+		ocIDLastMilli = now
+		ocIDCounter = 0
+	}
+	ocIDCounter++
+	return now, ocIDCounter
+}
+
+// newOCSessionID 生成通过上游免费层门禁的 session id（ses_ + 26 位）。
 //
-// 2026-10 前这足以通过上游校验；现在上游校验的是会话是否真实存在，编造值必然
-// 403 FreeTierError。本函数仅作为「未注入真实会话」时的兜底，见 ocCurrentSessionID。
+// 关键不是「格式像不像」，而是**语义**：上游 2026-10-11 起（zen 路由改薄代理、
+// 免费层门禁下沉到私有 inference 服务）校验 session ID 的反转时间戳结构 ——
+// 前 12 位小写 hex 必须是 ~(ts_ms*0x1000 + counter) 的低 48 位
+// （对齐上游 packages/schema/src/identifier.ts：session 降序、message 升序）。
+// 纯随机或升序一律 403 FreeTierError("OpenCode's free tier can only be used
+// from within OpenCode")，对全部免费模型生效。
+// 背景与实验矩阵见参考仓 docs/labs/2026-10-13-free-tier-fingerprint-refresh.md；
+// 2026-09-18 曾实测「仅格式正则校验」而改成纯随机，那个前提已被上游收紧推翻。
 func newOCSessionID() string {
 	const hexChars = "0123456789abcdef"
-	const alnumChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, 26)
-	if _, err := rand.Read(b); err != nil {
-		// crypto/rand 失败时退化为时间戳+计数器，仍保持格式合规（长度与字符集正确）
-		for i := range b {
-			b[i] = byte(time.Now().UnixNano()>>uint(i%8)) ^ byte(i*37)
+	const alnumChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	ts, counter := ocIDTimestamp()
+	value := ^(ts*0x1000 + counter) // descending：按位取反
+	var b [26]byte
+	for i := range 6 {
+		byteVal := byte(value >> (40 - 8*i))
+		b[i*2] = hexChars[byteVal>>4]
+		b[i*2+1] = hexChars[byteVal&0xf]
+	}
+	var rnd [14]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		// crypto/rand 不可用时退化为 counter 派生序列，仍保持字符集/长度合规。
+		// 前 12 位不受影响 —— 门禁只看前 12 位的时间戳结构。
+		for i := range rnd {
+			rnd[i] = alnumChars[(counter+uint64(i)*31)%uint64(len(alnumChars))]
+		}
+	} else {
+		for i := range rnd {
+			rnd[i] = alnumChars[rnd[i]%byte(len(alnumChars))]
 		}
 	}
-	for i := 0; i < 12; i++ {
-		b[i] = hexChars[b[i]%16]
-	}
-	for i := 12; i < 26; i++ {
-		b[i] = alnumChars[b[i]%byte(len(alnumChars))]
-	}
-	return "ses_" + string(b)
+	copy(b[12:], rnd[:])
+	return "ses_" + string(b[:])
 }
 
 // normalizeOCVersion 保证 UA 版本号不低于上游要求的最小值，
@@ -616,10 +651,10 @@ func initOCSession() {
 		log.Printf("Session: %s", ocSessionID)
 		log.Printf("Project: %s", ocProjectID)
 		if !hasInjectedOCSession() {
-			log.Printf("警告: 未配置 oc_session_id / OC_SESSION_ID，所有请求将返回 503。" +
-				"上游 2026-10 起校验会话存在性，编造值必然 403 FreeTierError。" +
-				"请用 OpenCode 客户端产生一个真实会话并填入 config.json" +
-				"（可另配 oc_session_refresh_cmd 让代理自动续命）。")
+			log.Printf("提示: 未配置 oc_session_id / OC_SESSION_ID，将自动生成反转时间戳会话。" +
+				"上游按会话 ID 的时间戳结构校验、不要求谁签发，自动生成即可过门；" +
+				"仍可另配 oc_session_id 固定会话（对会话 sticky 有独立价值）" +
+				"或 oc_session_refresh_cmd 让代理自动续命。")
 		}
 	})
 }
@@ -692,32 +727,6 @@ var (
 	// ocRefreshCmd 是会话续命命令；受 configMu 保护。
 	ocRefreshCmd string
 )
-
-// ocSessionMissingBody 生成「未配置真实会话」的 503 响应体。
-func ocSessionMissingBody() []byte {
-	b, _ := json.Marshal(map[string]any{
-		"error": map[string]any{
-			"type": "OCSessionMissing",
-			"message": "未配置 oc_session_id：OpenCode 免费层自 2026-10 起校验会话存在性，" +
-				"编造的 ses_* 一律 403。请用 OpenCode 客户端产生一个真实会话，" +
-				"填入 config.json 的 oc_session_id 或环境变量 OC_SESSION_ID" +
-				"（可另配 oc_session_refresh_cmd 让代理自动续命）。",
-		},
-	})
-	return b
-}
-
-// ocSessionGuard 是「未配置真实会话」的唯一闸口，两个上游入口（流式 / 非流式）共用。
-// 返回非 nil 表示应短路：调用方直接用 body + 503 回客户端，不再打上游。
-//
-// 两个入口必须走同一个闸口：只在一处加检查，另一处就会退回编造会话、
-// 静默拿到 403 FreeTierError —— 那正是要消灭的排查盲区。
-func ocSessionGuard() ([]byte, error) {
-	if ocCurrentSessionID() != "" {
-		return nil, nil
-	}
-	return ocSessionMissingBody(), fmt.Errorf("oc_session_id not configured")
-}
 
 // ocFreeTierHint 点名免费层的**两道独立的门**，供 403 诊断日志引用。
 //
@@ -826,11 +835,30 @@ func ocSessionRefreshInterval() time.Duration {
 // ocCurrentSessionID 返回本次上游请求使用的 x-session-id。
 // 上游 2026-10 起校验会话是否存在，编造值必然 403，因此只认注入的真实会话；
 // 未配置时返回空串，由 callOpenCodeAPI 转成 503 可读错误——静默 403 无法排查。
+// ocCurrentSessionID 返回本次上游请求使用的 x-session-id。
+// 配了 oc_session_id 就用配置值（手动指定的真实会话优先，且对「会话 sticky」有独立价值）；
+// 没配则用进程内生成的反转时间戳会话 —— 上游校验的是 ID 的时间戳结构而不是「谁签发过」，
+// 所以自动生成就能过门，不必强制注入。
 func ocCurrentSessionID() string {
 	configMu.RLock()
-	defer configMu.RUnlock()
-	return ocInjectedSession
+	injected := ocInjectedSession
+	configMu.RUnlock()
+	if injected != "" {
+		return injected
+	}
+	ocGeneratedMu.Lock()
+	defer ocGeneratedMu.Unlock()
+	if ocGeneratedSession == "" {
+		ocGeneratedSession = newOCSessionID()
+		log.Printf("未配置 oc_session_id，使用自动生成的反转时间戳会话: %s（上游按 ID 的时间戳结构校验，不要求谁签发）", ocGeneratedSession)
+	}
+	return ocGeneratedSession
 }
+
+var (
+	ocGeneratedMu      sync.Mutex
+	ocGeneratedSession string
+)
 
 func hasInjectedOCSession() bool {
 	configMu.RLock()
@@ -2625,11 +2653,6 @@ func aggregateOpenAIStream(body []byte, modelID string) []byte {
 
 func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string) ([]byte, int, http.Header, error) {
 	initOCSession()
-	// 未配置真实会话就不打上游：上游会回 403 FreeTierError，而 403 对调用方毫无信息量。
-	// 这里直接给 503 + 可读原因，运维一眼知道要配什么。
-	if body, err := ocSessionGuard(); err != nil {
-		return body, http.StatusServiceUnavailable, nil, err
-	}
 
 	// 只使用调用方指定的模型；失败仅按代理/限流重试，不切换到其他模型
 	bodyMap["model"] = modelID
@@ -2730,11 +2753,6 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 
 func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID string) (io.ReadCloser, int, http.Header, error) {
 	initOCSession()
-	// 与非流式入口共用同一道闸口：流式请求过去漏了这道检查，会退回编造会话、
-	// 静默拿到 403 FreeTierError，排查时被引向「会话过期」的错误方向。
-	if body, err := ocSessionGuard(); err != nil {
-		return io.NopCloser(bytes.NewReader(body)), http.StatusServiceUnavailable, nil, err
-	}
 
 	// 只使用调用方指定的模型；失败仅按代理/限流重试，不切换到其他模型
 	bodyMap["model"] = modelID

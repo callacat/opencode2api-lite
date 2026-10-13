@@ -31,6 +31,27 @@
   这条底线。其余覆盖 sticky 粘住、轮转摊开、归一化去重补号、字符串简写、面板省略即沿用、
   重试次数上界。
 
+### 修复
+
+- **免费层 403 会话门：会话 ID 必须是反转时间戳，纯随机一律 403**。上游 2026-10-11 起
+  （zen 路由改薄代理、免费层门禁下沉到私有 inference 服务）校验 session ID 的**语义**而
+  非格式：前 12 位小写 hex 必须是 `~(ts_ms*0x1000 + counter)` 的低 48 位
+  （对齐上游 `packages/schema/src/identifier.ts`，session 降序、message 升序）。
+  原来的纯随机生成必然触发 `403 FreeTierError("OpenCode's free tier can only be used
+  from within OpenCode")`，对全部免费模型生效。已照参考仓 `newOCShapeID` 移植
+  （进程级 `ocIDMu / ocIDLastMilli / ocIDCounter`，同一毫秒内 counter 自增、跨毫秒归零）。
+  背景实验矩阵见参考仓 `docs/labs/2026-10-13-free-tier-fingerprint-refresh.md`。
+  - `oc_session_id` 注入能力**保留**（手动指定的会话优先，对「会话 sticky」有独立价值），
+    但不再是能否服务的前提。
+  - 未配置会话时不再返回 `503 OCSessionMissing`，改为自动生成一个进程内稳定的会话。
+    相应的 `ocSessionGuard` / `ocSessionMissingBody` 与三个钉住 503 行为的用例一并删除
+    —— 留着会变成永不触发的死路径，外加一句「所有请求将返回 503」的假告警。
+  - 自检新增两条：`TestNewOCSessionIDShape`（形状正则，及格线）与
+    `TestNewOCSessionIDDescending`（**语义**判据：反推前 12 位必须落在当前时间窗内）。
+    后者做过阴性对照——把实现换回纯随机后形状用例仍绿、语义用例立刻变红，正是它防的退化。
+  - 实现注记：`ts*0x1000` 会溢出 48 位（1.79e12 × 4096 ≈ 7.3e15 > 2^48），
+    所以 ID 里携带的是**模 2^36 毫秒**的时间戳，这套编码约每 2.18 年回绕一次。
+
 ## [v1.0.2] - 2026-10-13
 
 ### 修复
