@@ -706,6 +706,21 @@ func hasInjectedOCSession() bool {
 	return ocInjectedSession != ""
 }
 
+// mergeOCSessionID 把面板/脚本回传的 oc_session_id 合进 cfg。
+// present=false（请求体省略该键）时沿用现值，避免一次旧版面板回传就把会话静默清空——
+// 这个字段是免费层能否通过上游存在性校验的唯一开关，清掉等于退回全量 403。
+func mergeOCSessionID(cfg *AppConfig, present bool, val string) {
+	if present {
+		cfg.OCSessionID = val
+		return
+	}
+	if hasInjectedOCSession() {
+		configMu.RLock()
+		cfg.OCSessionID = ocInjectedSession
+		configMu.RUnlock()
+	}
+}
+
 // ======================== 管理面板认证 ========================
 
 var (
@@ -5023,11 +5038,24 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(cfg)
 	case http.MethodPost:
-		var cfg AppConfig
-		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		// 用指针区分「字段省略」与「显式置空」：解到普通 string 时两者都是 ""，
+		// 会让面板清空操作失效。省略时沿用现值（免费层能否通过上游校验只取决于
+		// 这一个字段，一次旧版面板回传就会把它静默清空、服务随即全量 403）。
+		var body struct {
+			AppConfig
+			OCSessionID *string `json:"oc_session_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, `{"error":"Invalid JSON"}`, http.StatusBadRequest)
 			return
 		}
+		cfg := body.AppConfig
+		mergeOCSessionID(&cfg, body.OCSessionID != nil, func() string {
+			if body.OCSessionID != nil {
+				return *body.OCSessionID
+			}
+			return ""
+		}())
 		normalizeConfig(&cfg)
 		if err := saveConfig(configPath, cfg); err != nil {
 			http.Error(w, `{"error":"Failed to save config"}`, http.StatusInternalServerError)

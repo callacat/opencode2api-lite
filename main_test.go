@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -71,5 +72,58 @@ func TestNormalizeConfigTrimsSession(t *testing.T) {
 	normalizeConfig(&cfg)
 	if cfg.OCSessionID != "ses_abc" {
 		t.Errorf("会话 id 应去空白，得到 %q", cfg.OCSessionID)
+	}
+}
+
+// TestMergeOCSessionID 钉住面板回传配置的防丢行为：省略 oc_session_id 的请求体
+// 不得把现值清空（免费层能否通过上游校验只取决于这一个字段），显式传值才覆盖，
+// 显式传空串则允许清空。presence 判定必须由调用方用 *string 完成——
+// 直接解到 string 时「省略」与「空」不可区分。
+func TestMergeOCSessionID(t *testing.T) {
+	const real = "ses_ecbad4897ffe524uCAgXevWcMc"
+	applyConfig(AppConfig{OCSessionID: real})
+	defer applyConfig(AppConfig{OCSessionID: ""})
+
+	cases := []struct {
+		name    string
+		present bool
+		val     string
+		want    string
+	}{
+		{"省略该键应沿用现值", false, "", real},
+		{"显式空串应允许清空", true, "", ""},
+		{"显式新值应生效", true, "ses_xyz", "ses_xyz"},
+	}
+	for _, c := range cases {
+		cfg := AppConfig{}
+		mergeOCSessionID(&cfg, c.present, c.val)
+		normalizeConfig(&cfg)
+		if cfg.OCSessionID != c.want {
+			t.Errorf("%s: 得到 %q, 期望 %q", c.name, cfg.OCSessionID, c.want)
+		}
+	}
+}
+
+// TestConfigPostDecodePresence 确认 json 解码确实能区分「键缺失」与「显式空串」，
+// 这是 mergeOCSessionID 的 present 参数成立的前提。
+func TestConfigPostDecodePresence(t *testing.T) {
+	decode := func(body string) *string {
+		var b struct {
+			AppConfig
+			OCSessionID *string `json:"oc_session_id"`
+		}
+		if err := json.Unmarshal([]byte(body), &b); err != nil {
+			t.Fatalf("解析失败: %v", err)
+		}
+		return b.OCSessionID
+	}
+	if p := decode(`{"model_alias":{}}`); p != nil {
+		t.Errorf("键缺失时应得 nil，得到 %q", *p)
+	}
+	if p := decode(`{"model_alias":{},"oc_session_id":""}`); p == nil || *p != "" {
+		t.Errorf("显式空串应得非 nil 的空串，得到 %v", p)
+	}
+	if p := decode(`{"model_alias":{},"oc_session_id":"ses_a"}`); p == nil || *p != "ses_a" {
+		t.Errorf("显式新值应原样解出，得到 %v", p)
 	}
 }
