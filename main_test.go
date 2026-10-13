@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -35,15 +36,15 @@ func TestNormalizeOCVersion(t *testing.T) {
 	}
 }
 
-// TestOCSessionInjection 钉住 2026-10 上游校验变更后的会话选取逻辑：
-// 注入的真实会话必须被原样使用，未注入时才退回编造（且编造值仍须格式合规）。
-// 上游已从「格式校验」改为「会话存在性校验」，编造值必然 403 FreeTierError。
+// TestOCSessionInjection 钉住 2026-10 上游改会话存在性校验后的选取契约：
+// 注入的真实会话被原样使用；未注入时**不编造**（返回空串，由 callOpenCodeAPI 转 503），
+// 因为编造值必然 403 FreeTierError，而 403 对调用方毫无信息量。
 func TestOCSessionInjection(t *testing.T) {
 	const real = "ses_ecbad4897ffe524uCAgXevWcMc"
 
 	applyConfig(AppConfig{OCSessionID: real})
 	if got := ocCurrentSessionID(); got != real {
-		t.Fatalf("注入真实会话后应原样使用，得到 %s", got)
+		t.Fatalf("注入真实会话后应原样使用，得到 %q", got)
 	}
 	if !hasInjectedOCSession() {
 		t.Error("已注入会话时 hasInjectedOCSession 应为 true")
@@ -53,15 +54,82 @@ func TestOCSessionInjection(t *testing.T) {
 	if hasInjectedOCSession() {
 		t.Error("清空注入后 hasInjectedOCSession 应为 false")
 	}
-	fallback := ocCurrentSessionID()
-	if fallback == real {
-		t.Error("未注入时不应回落到上一次注入的会话")
+	if got := ocCurrentSessionID(); got != "" {
+		t.Errorf("未注入时不应编造会话（会必然 403），得到 %q", got)
 	}
-	if len(fallback) != len("ses_")+26 {
-		t.Errorf("兜底会话长度应为 %d，得到 %d (%s)", len("ses_")+26, len(fallback), fallback)
+}
+
+// TestOCSessionMissingBody 确认 503 响应体可读：调用方要能一眼看出该配什么。
+func TestOCSessionMissingBody(t *testing.T) {
+	var resp struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
-	if !strings.HasPrefix(fallback, "ses_") {
-		t.Errorf("兜底会话应保留 ses_ 前缀，得到 %s", fallback)
+	if err := json.Unmarshal(ocSessionMissingBody(), &resp); err != nil {
+		t.Fatalf("503 响应体不是合法 JSON: %v", err)
+	}
+	if resp.Error.Type != "OCSessionMissing" {
+		t.Errorf("错误类型 = %q, 期望 OCSessionMissing", resp.Error.Type)
+	}
+	if !strings.Contains(resp.Error.Message, "oc_session_id") {
+		t.Errorf("错误信息应点名要配的字段，得到 %q", resp.Error.Message)
+	}
+}
+
+// TestOCSessionRe 钉住会话 id 的解析规则：只认规范长度 26 的 ses_*，
+// 免得续命命令输出里的噪声被当成会话写进配置。
+func TestOCSessionRe(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"created id=ses_ecbad4897ffe524uCAgXevWcMc", "ses_ecbad4897ffe524uCAgXevWcMc"},
+		{"ses_aaaaaaaaaaaaa", ""},             // 太短
+		{"ses_ZZZZZZZZZZZZZZZZZZZZZZZZZ", ""}, // 前 12 位非十六进制
+		{"no session here", ""},
+	}
+	for _, c := range cases {
+		got := ocSessionRe.FindString(c.in)
+		if got != c.want {
+			t.Errorf("ocSessionRe(%q) = %q, 期望 %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestRefreshOCSessionOnce 端到端验证续命：命令输出里的 ses_* 被采纳并写回内存。
+// 只测内存态，不碰磁盘上的 config.json。
+func TestRefreshOCSessionOnce(t *testing.T) {
+	// refreshOCSessionOnce 会写回 config.json，指向临时目录避免污染仓库
+	oldPath := configPath
+	configPath = filepath.Join(t.TempDir(), "config.json")
+	defer func() {
+		configPath = oldPath
+		applyConfig(AppConfig{})
+		ocRefreshCmd = ""
+	}()
+	applyConfig(AppConfig{OCSessionID: "ses_ecbad4897ffe524uCAgXevWcMc"})
+
+	// 未配置命令时应安静返回 false，不做任何事。
+	if refreshOCSessionOnce() {
+		t.Error("未配置续命命令时不应刷新成功")
+	}
+
+	const fresh = "ses_0123456789abABCDEFGHIJKLMN"
+	if len(fresh) != len("ses_")+26 || !ocSessionRe.MatchString(fresh) {
+		t.Fatalf("测试常量本身不合法（长度 %d）: %s", len(fresh), fresh)
+	}
+	ocRefreshCmd = "echo 'message=created id=" + fresh + "'"
+	if !refreshOCSessionOnce() {
+		t.Fatal("命令输出含合法 ses_* 时应刷新成功")
+	}
+	if got := ocCurrentSessionID(); got != fresh {
+		t.Errorf("续命后应使用新会话，得到 %q", got)
+	}
+	// 同一个会话再跑一次不算更新。
+	if refreshOCSessionOnce() {
+		t.Error("输出与现值相同时不应算作刷新")
 	}
 }
 

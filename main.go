@@ -15,6 +15,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -614,9 +616,10 @@ func initOCSession() {
 		log.Printf("Session: %s", ocSessionID)
 		log.Printf("Project: %s", ocProjectID)
 		if !hasInjectedOCSession() {
-			log.Printf("警告: 未配置 oc_session_id / OC_SESSION_ID，将编造 session id。" +
+			log.Printf("警告: 未配置 oc_session_id / OC_SESSION_ID，所有请求将返回 503。" +
 				"上游 2026-10 起校验会话存在性，编造值必然 403 FreeTierError。" +
-				"请用 OpenCode 客户端产生一个真实会话并填入 config.json。")
+				"请用 OpenCode 客户端产生一个真实会话并填入 config.json" +
+				"（可另配 oc_session_refresh_cmd 让代理自动续命）。")
 		}
 	})
 }
@@ -686,18 +689,106 @@ var (
 
 	// ocInjectedSession 是配置注入的真实 OpenCode 会话 id，受 configMu 保护。
 	ocInjectedSession string
+	// ocRefreshCmd 是会话续命命令；受 configMu 保护。
+	ocRefreshCmd string
 )
 
+// ocSessionMissingBody 生成「未配置真实会话」的 503 响应体。
+func ocSessionMissingBody() []byte {
+	b, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"type": "OCSessionMissing",
+			"message": "未配置 oc_session_id：OpenCode 免费层自 2026-10 起校验会话存在性，" +
+				"编造的 ses_* 一律 403。请用 OpenCode 客户端产生一个真实会话，" +
+				"填入 config.json 的 oc_session_id 或环境变量 OC_SESSION_ID" +
+				"（可另配 oc_session_refresh_cmd 让代理自动续命）。",
+		},
+	})
+	return b
+}
+
+// ocSessionRe 匹配 OpenCode 会话 id：ses_ + 12 位小写十六进制 + 14 位 [A-Za-z0-9]。
+var ocSessionRe = regexp.MustCompile(`ses_[0-9a-f]{12}[A-Za-z0-9]{14}`)
+
+// refreshOCSessionOnce 运行续命命令，解析出新会话则写回内存与 config.json。
+// 返回是否拿到了新会话。命令失败/输出里没有 ses_* 都只记日志，不影响主流程。
+func refreshOCSessionOnce() bool {
+	configMu.RLock()
+	cmd := ocRefreshCmd
+	configMu.RUnlock()
+	if strings.TrimSpace(cmd) == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
+	if err != nil {
+		log.Printf("会话续命命令失败: %v (输出: %s)", err, strings.TrimSpace(string(out)))
+		return false
+	}
+	m := ocSessionRe.Find(out)
+	if m == nil {
+		log.Printf("会话续命命令未输出 ses_*: %s", strings.TrimSpace(string(out)))
+		return false
+	}
+	sid := string(m)
+	if sid == ocCurrentSessionID() {
+		return false
+	}
+	configMu.Lock()
+	ocInjectedSession = sid
+	ocSessionID = sid
+	cmd2 := ocRefreshCmd
+	configMu.Unlock()
+	log.Printf("会话已自动续命: %s", sid)
+	if err := saveConfig(configPath, AppConfig{
+		ModelAlias:          modelAlias,
+		ReasoningEffortMap:  reasoningEffortMap,
+		OCSessionID:         sid,
+		OCSessionRefreshCmd: cmd2,
+	}); err != nil {
+		log.Printf("警告: 续命后的会话写回 config 失败: %v", err)
+	}
+	return true
+}
+
+// startOCSessionRefresh 按固定间隔后台续命。间隔取 refresh_interval，
+// 未配置时用默认 30 分钟——实测有效期下限 52 分钟，30 分钟留了一倍余量。
+func startOCSessionRefresh(interval time.Duration) {
+	if interval <= 0 {
+		interval = 30 * time.Minute
+	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for range t.C {
+			refreshOCSessionOnce()
+		}
+	}()
+}
+
+// ocSessionRefreshInterval 解析续命间隔，非法或未设置时回落到 30 分钟。
+func ocSessionRefreshInterval() time.Duration {
+	const def = 30 * time.Minute
+	v := strings.TrimSpace(os.Getenv("OC_SESSION_REFRESH_INTERVAL"))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		log.Printf("警告: OC_SESSION_REFRESH_INTERVAL=%q 无法解析，回落到 %s", v, def)
+		return def
+	}
+	return d
+}
+
 // ocCurrentSessionID 返回本次上游请求使用的 x-session-id。
-// 上游 2026-10 起校验会话是否存在，编造值必然 403，因此优先用注入的真实会话。
+// 上游 2026-10 起校验会话是否存在，编造值必然 403，因此只认注入的真实会话；
+// 未配置时返回空串，由 callOpenCodeAPI 转成 503 可读错误——静默 403 无法排查。
 func ocCurrentSessionID() string {
 	configMu.RLock()
-	sid := ocInjectedSession
-	configMu.RUnlock()
-	if sid != "" {
-		return sid
-	}
-	return newOCSessionID()
+	defer configMu.RUnlock()
+	return ocInjectedSession
 }
 
 func hasInjectedOCSession() bool {
@@ -912,8 +1003,13 @@ type AppConfig struct {
 	ActiveSocks5       string            `json:"active_socks5,omitempty"`
 
 	// OCSessionID 是 OpenCode 客户端真实创建过的会话 id。上游 2026-10 起校验
-	// 会话存在性，编造的 ses_* 一律 403；留空则退回编造（必然 403）。
+	// 会话存在性，编造的 ses_* 一律 403；留空则拒绝服务（503），不再编造。
 	OCSessionID string `json:"oc_session_id,omitempty"`
+
+	// OCSessionRefreshCmd 是可执行命令：代理定期运行它，从 stdout/stderr 里解析
+	// 出新的 ses_* 并写回配置，用于会话过期后自动续命（有效期下限实测 ≥52 分钟，
+	// 上限未知）。留空则只用 OCSessionID，不自动续。
+	OCSessionRefreshCmd string `json:"oc_session_refresh_cmd,omitempty"`
 }
 
 // ======================== Claude Messages API 类型 ========================
@@ -1045,6 +1141,7 @@ func normalizeConfig(cfg *AppConfig) {
 		cfg.ReasoningEffortMap = map[string]string{}
 	}
 	cfg.OCSessionID = strings.TrimSpace(cfg.OCSessionID)
+	cfg.OCSessionRefreshCmd = strings.TrimSpace(cfg.OCSessionRefreshCmd)
 }
 
 func saveConfig(path string, cfg AppConfig) error {
@@ -1066,6 +1163,7 @@ func applyConfig(cfg AppConfig) {
 		reasoningEffortMap = cfg.ReasoningEffortMap
 	}
 	ocInjectedSession = cfg.OCSessionID
+	ocRefreshCmd = cfg.OCSessionRefreshCmd
 	if ocInjectedSession != "" && ocSessionID != "" {
 		// 面板改会话后立即生效，无需重启：把已初始化的会话也换掉。
 		ocSessionID = ocInjectedSession
@@ -2259,6 +2357,12 @@ func aggregateOpenAIStream(body []byte, modelID string) []byte {
 
 func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string) ([]byte, int, http.Header, error) {
 	initOCSession()
+	// 未配置真实会话就不打上游：上游会回 403 FreeTierError，而 403 对调用方毫无信息量。
+	// 这里直接给 503 + 可读原因，运维一眼知道要配什么。
+	if ocCurrentSessionID() == "" {
+		return ocSessionMissingBody(), http.StatusServiceUnavailable, nil,
+			fmt.Errorf("oc_session_id not configured")
+	}
 
 	// 只使用调用方指定的模型；失败仅按代理/限流重试，不切换到其他模型
 	bodyMap["model"] = modelID
@@ -5029,7 +5133,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		configMu.RLock()
-		cfg := AppConfig{ModelAlias: modelAlias, ReasoningEffortMap: reasoningEffortMap, OCSessionID: ocInjectedSession}
+		cfg := AppConfig{ModelAlias: modelAlias, ReasoningEffortMap: reasoningEffortMap, OCSessionID: ocInjectedSession, OCSessionRefreshCmd: ocRefreshCmd}
 		configMu.RUnlock()
 		socks5Mu.RLock()
 		cfg.Socks5Proxies = socks5Proxies
@@ -5395,7 +5499,11 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 </div>
 <div class="form-group">
 <label>OpenCode 会话 ID</label>
-<input id="ocSessionId" class="m-input" placeholder="ses_...（OpenCode 客户端真实创建的会话，留空则编造并必然 403）">
+<input id="ocSessionId" class="m-input" placeholder="ses_...（OpenCode 客户端真实创建的会话；留空则服务返回 503）">
+</div>
+<div class="form-group">
+<label>会话自动续命命令</label>
+<input id="ocSessionRefreshCmd" class="m-input" placeholder="留空则不自动续；填命令后代理定期执行并解析输出里的 ses_*">
 </div>
 <div class="actions">
 <button class="btn btn-primary" onclick="addSocks5Row()">添加代理</button>
@@ -5411,7 +5519,7 @@ function toggleTheme(){const d=document.documentElement;const cur=d.getAttribute
 (function(){const t=localStorage.getItem('theme');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');document.addEventListener('DOMContentLoaded',()=>{const b=document.querySelector('.theme-toggle');if(b)b.textContent='🌙'})}})();
 function reloadConfig(){const sy=window.scrollY;fetch('/api/reload',{method:'POST'}).then(r=>r.json()).then(d=>{showToast('会话已刷新，模型 '+d.models+' 个','success')}).catch(()=>{}).finally(()=>{loadConfig();loadStats();setTimeout(()=>window.scrollTo(0,sy),100)})}
 function normalizeAliasData(){const next={};Object.keys(aliasData||{}).forEach(k=>{const raw=aliasData[k];if(typeof raw==='object'&&raw){next[k]={target_model:raw.target_model||k,multimodal_model:raw.multimodal_model||''}}else{next[k]={target_model:typeof raw==='string'&&raw?raw:k,multimodal_model:''}}});aliasData=next}
-async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');if(!r.ok)throw new Error(await r.text());const cfg=await r.json();aliasData=cfg.model_alias||{};normalizeAliasData();effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';document.getElementById('ocSessionId').value=cfg.oc_session_id||'';setTimeout(()=>window.scrollTo(0,sy),0);try{const mr=await fetch('/api/models');const md=await mr.json();modelList=(md.models||[]).sort();renderAliasTable()}catch(_){}}catch(e){showToast('失败: '+e.message,'error')}}
+async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');if(!r.ok)throw new Error(await r.text());const cfg=await r.json();aliasData=cfg.model_alias||{};normalizeAliasData();effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';document.getElementById('ocSessionId').value=cfg.oc_session_id||'';document.getElementById('ocSessionRefreshCmd').value=cfg.oc_session_refresh_cmd||'';setTimeout(()=>window.scrollTo(0,sy),0);try{const mr=await fetch('/api/models');const md=await mr.json();modelList=(md.models||[]).sort();renderAliasTable()}catch(_){}}catch(e){showToast('失败: '+e.message,'error')}}
 function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="4" class="empty-hint">暂无别名配置</td></tr>';return}tb.innerHTML=ks.map(k=>{const entry=aliasData[k]||{target_model:k};return '<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+modelSelectHtml(entry.target_model||k,'val')+'</td><td>'+modelSelectHtml(entry.multimodal_model||'','mm')+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>'}).join('')}
 function modelSelectHtml(selected,field){let h='<select data-field="'+(field||'val')+'" class="m-select">';h+='<option value="">-- 选择模型 --</option>';let found=!selected;for(const m of modelList){if(selected===m)found=true;h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (自定义)</option>';h+='</select>';return h}
 function addAliasRow(){const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: deepseek-reasoner" data-field="key"></td><td>'+modelSelectHtml('','val')+'</td><td>'+modelSelectHtml('','mm')+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>')}
@@ -5429,7 +5537,7 @@ function addSocks5Row(){const tb=document.querySelector('#socks5Table tbody');if
 function delSocks5(i){socks5Data.splice(i,1);renderSocks5Table()}
 function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});socks5Data=r;return r}
 function renderSocks5Select(){const sel=document.getElementById('activeSocks5');const cur=sel.value;sel.innerHTML='<option value="">直连（不使用代理）</option>';socks5Data.forEach(p=>{if(p.addr){const label=p.name?p.name+' ('+p.addr+')':p.addr;const opt=document.createElement('option');opt.value=p.addr;opt.textContent=label;sel.appendChild(opt)}});if(socks5Data.length>=1){const opt=document.createElement('option');opt.value='__rate_limit_switch__';opt.textContent='限流切换（429 后切换，含直连）';sel.appendChild(opt);const opt2=document.createElement('option');opt2.value='__rate_limit_switch_no_direct__';opt2.textContent='限流切换（429 后切换，不含直连）';sel.appendChild(opt2)}if(socks5Data.length>=2){const opt=document.createElement('option');opt.value='__round_robin__';opt.textContent='轮询（每次请求切换）';sel.appendChild(opt)}sel.value=cur;if(!sel.value)sel.value='';}
-async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value,oc_session_id:document.getElementById('ocSessionId').value.trim()};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
+async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value,oc_session_id:document.getElementById('ocSessionId').value.trim(),oc_session_refresh_cmd:document.getElementById('ocSessionRefreshCmd').value.trim()};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
 async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await fetch('/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}
@@ -5476,6 +5584,10 @@ func main() {
 		log.Printf("警告: 无法保存配置: %v", err)
 	}
 
+	if strings.TrimSpace(cfg.OCSessionRefreshCmd) != "" {
+		startOCSessionRefresh(ocSessionRefreshInterval())
+		log.Printf("会话自动续命已启用，每 %s 执行一次", ocSessionRefreshInterval())
+	}
 	loadTokenStats()
 	log.Printf("配置已从 %s 加载", configPath)
 	log.Printf("OPENCODE TO API 代理服务器")

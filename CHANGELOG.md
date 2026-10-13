@@ -19,17 +19,28 @@
 ### 新增
 
 - 配置项 `oc_session_id` 与环境变量 `OC_SESSION_ID`：注入 OpenCode 客户端真实创建过的会话。
-  未注入时退回编造并在启动日志打印告警，直言该路径必然 403，不再静默失败。
-- 管理面板新增「OpenCode 会话 ID」输入项，保存配置时随其余字段一起回写（此前面板「保存全部」
-  只提交已知字段，新增字段若不回写会被静默清空）。
-- `TestOCSessionInjection` / `TestNormalizeConfigTrimsSession` 两个自检，钉住会话选取与去空白。
+  **未配置时不再编造**（编造必然 403），直接返回 `503 OCSessionMissing` 并在错误信息里写明
+  要配什么——静默的 403 对调用方毫无信息量。
+- 配置项 `oc_session_refresh_cmd` 与环境变量 `OC_SESSION_REFRESH_INTERVAL`（默认 30m）：
+  代理定期执行该命令，从输出里解析 `ses_[0-9a-f]{12}[A-Za-z0-9]{14}` 并写回内存与 config.json，
+  解决会话过期后的续命问题（实测有效期下限 52 分钟，故默认间隔取其一半留一倍余量）。
+  典型命令：`opencode run "x" 2>&1 | grep -o 'ses_[0-9a-f]\{12\}[A-Za-z0-9]\{14\}'`
+- 管理面板新增「OpenCode 会话 ID」与「会话自动续命命令」两项输入，保存时一并回写。
+- 面板回传配置时若请求体省略 `oc_session_id` 会沿用现值——旧版前端/脚本只提交已知字段，
+  直接解进新 struct 会把会话静默清空、服务随即退回 403。
+- 自检扩充到 9 个用例：`TestOCSessionInjection`（含「未配置不编造」）、
+  `TestOCSessionMissingBody`、`TestOCSessionRe`、`TestRefreshOCSessionOnce`、
+  `TestNormalizeConfigTrimsSession`、`TestMergeOCSessionID`、`TestConfigPostDecodePresence`。
 
 ### 已知限制
 
 - 上游未提供匿名会话注册端点（`zen/v1/session(s)`、`inference/v1/session(s)`、`api/session`
   均 404；客户端二进制中也无注册端点），因此真实会话只能由 OpenCode 客户端产生后注入。
-- 会话有效期未量化：实测 2026-10-13 16:13 产生的会话至 17:4x 仍返回 200，但过期时间未知。
-  会话失效后表现为 403 FreeTierError，需重新注入。
+- 会话有效期未量化：实测 2026-10-13 16:13 产生的会话至 17:2x 仍返回 200（下限 ≥52 分钟），
+  上限未知。`oc_session_refresh_cmd` 的默认 30 分钟间隔建立在这个下限之上；若实际 TTL
+  短于该间隔，需调小 `OC_SESSION_REFRESH_INTERVAL`。
+- 会话刷新命令需要能创建真实会话的凭据（如本机 `opencode run` + `auth.json` 里的 oc_sk key），
+  该凭据不随本项目分发，部署方需自备。
 
 ### 回滚
 
