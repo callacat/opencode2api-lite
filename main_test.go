@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -169,6 +172,99 @@ func TestMergeOCSessionID(t *testing.T) {
 		if cfg.OCSessionID != c.want {
 			t.Errorf("%s: 得到 %q, 期望 %q", c.name, cfg.OCSessionID, c.want)
 		}
+	}
+}
+
+// TestFreeTierToolsGate 钉住免费层的第二道门：请求体的 tools 必须同时含 bash 与 read。
+//
+// 这道门与 x-session-id 相互独立 —— 会话有效但 tools 被「精简」掉，上游照样回 403
+// FreeTierError（2026-10-13 实测：无 tools / 缺 read / 缺 bash 均 403，bash+read 与四件套 200）。
+// 修 403 时极易只查会话，故在此把四种 tools 形态都钉住：谁把补齐逻辑改坏，这里就红。
+func TestFreeTierToolsGate(t *testing.T) {
+	names := func(body map[string]any) map[string]bool {
+		got := map[string]bool{}
+		for _, raw := range body["tools"].([]any) {
+			if n := toolNameOf(raw); n != "" {
+				got[n] = true
+			}
+		}
+		return got
+	}
+
+	cases := []struct {
+		name string
+		body map[string]any
+		keep []string // 补齐后必须仍然存在的客户端原有工具
+	}{
+		{"客户端没带 tools", map[string]any{}, nil},
+		{"[]Tool 形态（生产实际形态）", map[string]any{
+			"tools": []Tool{{Type: "function", Function: ToolFunction{Name: "get_weather"}}},
+		}, []string{"get_weather"}},
+		{"[]any 形态（旧 JSON 往返路径）", map[string]any{
+			"tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "get_weather"}}},
+		}, []string{"get_weather"}},
+		{"[]map[string]any 形态（仅扫描兼容，合并不保留）", map[string]any{
+			"tools": []map[string]any{{"type": "function", "function": map[string]any{"name": "get_weather"}}},
+		}, nil},
+		{"客户端已自带 bash 但缺 read", map[string]any{
+			"tools": []Tool{{Type: "function", Function: ToolFunction{Name: "bash"}}},
+		}, []string{"bash"}},
+	}
+
+	for _, c := range cases {
+		ensureFreeTierTools(c.body)
+		got := names(c.body)
+		if !got["bash"] || !got["read"] {
+			t.Errorf("%s: 补齐后应同时含 bash 与 read，实际 %v", c.name, got)
+		}
+		// 客户端自带的工具不能被桩四件套挤掉（历史上真出过：模型抱怨「看不到 get_weather」）
+		for _, k := range c.keep {
+			if !got[k] {
+				t.Errorf("%s: 补齐后丢了客户端原有工具 %q，实际 %v", c.name, k, got)
+			}
+		}
+	}
+}
+
+// TestSessionGuardBothEntryPoints 钉住「未配置真实会话就不打上游」这条契约在**两个**入口都成立。
+//
+// 曾经只有非流式入口有这道闸口，流式请求会退回编造会话、静默拿到 403 FreeTierError，
+// 运维看到 403 会误判成「会话过期」，排查方向被带偏。
+func TestSessionGuardBothEntryPoints(t *testing.T) {
+	// 预置 sync.Once，跳过 initOCSession 里的版本探测网络请求，让用例纯离线。
+	ocOnce.Do(func() {})
+
+	applyConfig(AppConfig{})
+	defer applyConfig(AppConfig{})
+
+	body, status, _, err := callOpenCodeAPI(context.Background(), map[string]any{}, "big-pickle")
+	assertMissing := func(what string, body []byte, status int, err error) {
+		t.Helper()
+		if err == nil {
+			t.Errorf("%s: 未配置会话时应返回错误", what)
+		}
+		if status != http.StatusServiceUnavailable {
+			t.Errorf("%s: 状态码 = %d, 期望 503", what, status)
+		}
+		if !strings.Contains(string(body), "OCSessionMissing") {
+			t.Errorf("%s: 响应体应含 OCSessionMissing，得到 %q", what, string(body))
+		}
+	}
+	assertMissing("非流式入口", body, status, err)
+
+	stream, sStatus, _, sErr := callOpenCodeAPIStream(context.Background(), map[string]any{}, "big-pickle")
+	if stream != nil {
+		defer stream.Close()
+		got, _ := io.ReadAll(stream)
+		assertMissing("流式入口", got, sStatus, sErr)
+	} else {
+		t.Fatal("流式入口未配置会话时应返回非 nil 的响应体")
+	}
+
+	// 配了真实会话后闸口必须放行（否则修复过头，把正常请求也挡了）
+	applyConfig(AppConfig{OCSessionID: "ses_ecbad4897ffe524uCAgXevWcMc"})
+	if b, err := ocSessionGuard(); err != nil || b != nil {
+		t.Errorf("已配置会话时闸口应放行，得到 body=%s err=%v", string(b), err)
 	}
 }
 

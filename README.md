@@ -94,6 +94,8 @@ curl -s http://127.0.0.1:8000/v1/messages \
 | `reasoning_effort_map` | 可选，按模型指定 reasoning effort |
 | `socks5_proxies` | 出口代理列表，每项 `addr` / `username` / `password` / `name` |
 | `active_socks5` | 出口选择：`""` 直连；`"127.0.0.1:7890"` 指定代理；`"__round_robin__"` 每请求轮询；`"__rate_limit_switch__"` 遇 429 轮换（含直连）；`"__rate_limit_switch_no_direct__"` 同上但只用代理 |
+| `oc_session_id` | 免费层必需的**真实会话 ID**（`ses_` 开头 + 26 位）。上游 2026-10 起校验会话存在性，编造的 `ses_*` 一律 403；未配置时代理返回 `503 OCSessionMissing`（而不是静默 403）。也可用环境变量 `OC_SESSION_ID` 注入。**注意：会话有效并不等于能过**——请求体的 `tools` 还必须同时含 `bash` 与 `read`（缺任一同样 403，由代理自动补齐，勿在客户端精简掉）。两道门都失效时，上游只回一个不区分来源的 `403 FreeTierError` |
+| `oc_session_refresh_cmd` | 可选。定期执行的命令，从其输出里解析新的 `ses_*` 自动续命（默认每 30 分钟，`OC_SESSION_REFRESH_INTERVAL` 可调）。上游无匿名会话注册端点，会话只能由 OpenCode 客户端产生，有效期未公开量化 |
 
 ## HTTP 接口
 

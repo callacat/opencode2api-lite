@@ -707,6 +707,47 @@ func ocSessionMissingBody() []byte {
 	return b
 }
 
+// ocSessionGuard 是「未配置真实会话」的唯一闸口，两个上游入口（流式 / 非流式）共用。
+// 返回非 nil 表示应短路：调用方直接用 body + 503 回客户端，不再打上游。
+//
+// 两个入口必须走同一个闸口：只在一处加检查，另一处就会退回编造会话、
+// 静默拿到 403 FreeTierError —— 那正是要消灭的排查盲区。
+func ocSessionGuard() ([]byte, error) {
+	if ocCurrentSessionID() != "" {
+		return nil, nil
+	}
+	return ocSessionMissingBody(), fmt.Errorf("oc_session_id not configured")
+}
+
+// ocFreeTierHint 点名免费层的**两道独立的门**，供 403 诊断日志引用。
+//
+// 2026-10-13 独立复核实测（同一 pinned 会话、同一出口，只变 tools，n=2/组）：
+//
+//	tools = [bash, read]                 → 200
+//	tools = bash/glob/grep/read 四件套   → 200
+//	请求体无 tools 字段                  → 403
+//	tools = bash/glob/grep（缺 read）    → 403
+//	tools = glob/grep/read（缺 bash）    → 403
+//
+// 会话对了但 tools 被「精简」掉，照样全量 403。403 本身不区分是哪一道门，
+// 排查时极易只盯着 session，把时间花错地方。
+func ocFreeTierHint() string {
+	return "免费层有两道独立的门：(1) x-session-id 必须是真实注册过的会话（见 oc_session_id）；" +
+		"(2) 请求体 tools 必须同时含 bash 与 read（由 ensureFreeTierTools 补齐，勿精简）"
+}
+
+// logFreeTierRejection 在上游回 403 FreeTierError 时无条件记一行诊断。
+//
+// 403 是硬失败、不是临时故障，且两道门任一失效都表现为它，故不受 debugMode 约束 ——
+// 生产默认不开 -debug，此前这类 403 在日志里完全不可见。
+func logFreeTierRejection(ctx context.Context, modelID string, status int, body []byte) {
+	if status != http.StatusForbidden || !bytes.Contains(body, []byte("FreeTierError")) {
+		return
+	}
+	log.Printf("%s[free tier rejected] model=%s status=%d body=%s hint=%s",
+		labelPrefix(ctx), modelID, status, string(body), ocFreeTierHint())
+}
+
 // ocSessionRe 匹配 OpenCode 会话 id：ses_ + 12 位小写十六进制 + 14 位 [A-Za-z0-9]。
 var ocSessionRe = regexp.MustCompile(`ses_[0-9a-f]{12}[A-Za-z0-9]{14}`)
 
@@ -2359,9 +2400,8 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 	initOCSession()
 	// 未配置真实会话就不打上游：上游会回 403 FreeTierError，而 403 对调用方毫无信息量。
 	// 这里直接给 503 + 可读原因，运维一眼知道要配什么。
-	if ocCurrentSessionID() == "" {
-		return ocSessionMissingBody(), http.StatusServiceUnavailable, nil,
-			fmt.Errorf("oc_session_id not configured")
+	if body, err := ocSessionGuard(); err != nil {
+		return body, http.StatusServiceUnavailable, nil, err
 	}
 
 	// 只使用调用方指定的模型；失败仅按代理/限流重试，不切换到其他模型
@@ -2435,6 +2475,7 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 				continue
 			}
 		}
+		logFreeTierRejection(ctx, modelID, resp.StatusCode, errBody)
 		if debugMode {
 			log.Printf("%s[upstream error] model=%s status=%d body=%s", labelPrefix(ctx), modelID, resp.StatusCode, string(errBody))
 		}
@@ -2451,6 +2492,11 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 
 func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID string) (io.ReadCloser, int, http.Header, error) {
 	initOCSession()
+	// 与非流式入口共用同一道闸口：流式请求过去漏了这道检查，会退回编造会话、
+	// 静默拿到 403 FreeTierError，排查时被引向「会话过期」的错误方向。
+	if body, err := ocSessionGuard(); err != nil {
+		return io.NopCloser(bytes.NewReader(body)), http.StatusServiceUnavailable, nil, err
+	}
 
 	// 只使用调用方指定的模型；失败仅按代理/限流重试，不切换到其他模型
 	bodyMap["model"] = modelID
@@ -2496,6 +2542,7 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 				continue
 			}
 		}
+		logFreeTierRejection(ctx, modelID, resp.StatusCode, errBody)
 		if debugMode {
 			log.Printf("%s[upstream error] model=%s status=%d body=%s", labelPrefix(ctx), modelID, resp.StatusCode, string(errBody))
 		}
