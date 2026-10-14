@@ -2,6 +2,29 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- **出口配置被静默清空，导致服务绕过 mihomo 直连出墙**（现网事故，2026-10-14）。
+  `config.json` 里的 `socks5_proxies` / `active_socks5` 不知何时被清成空，容器日志随即
+  从 `exit=OC出口 (mihomo:20819)` 变成 `exit=direct` —— 全量绕开代理直连，请求来源 IP
+  与地理身份一起变了，而服务「看起来完全健康」。
+  - 根因在 `POST /api/config`：请求体解到普通值时，「键缺失」与「显式置空」是同一个零值，
+    服务端区分不了，于是按全量覆盖写回。v1.0.0 与 v1.0.3 先后给 `oc_session_id`、`key_pool`
+    补了「省略即沿用」，**出口配置这两个字段一直没有同等待遇** —— 任何只带部分字段的回传
+    （旧版面板页、脚本、别的客户端）都会把它们连同 `model_alias`、`reasoning_effort_map`
+    一起清空。后两个比出口配置更隐蔽：`normalizeConfig` 先把 nil 补成空 map，
+    `applyConfig` 里的 `!= nil` 保护因此完全失效。
+  - 请求体这四个字段（外加既有的 `oc_session_id` / `key_pool`）统一改用指针，合进
+    `configPostBody.merge()`：键缺失一律沿用现值，显式给出（哪怕是空数组 / 空串）才是「清空」。
+    沿用走现有全局快照（`configMu` / `socks5Mu` / `currentKeyPool`），无新增状态。
+  - 落盘那份同样扛得住重启 —— 只护内存不护文件的话，下次容器启动照样读回空配置。
+  - 自检 19 → 21。`TestConfigPostOmittedFieldsKeepCurrent` 打的是真的
+    `adminConfigHandler`（解码 + 合并 + 落盘全链路），不是把 body 结构体外抄一遍；
+    已做变异验证：去掉沿用保护该用例如期转红。`TestConfigPostExplicitEmptyStillClears`
+    守住反向 —— 显式置空必须真的清掉，否则这条保护会把出口代理变成不可撤销的。
+
 ## [v1.0.3] - 2026-10-14
 
 ### 新增

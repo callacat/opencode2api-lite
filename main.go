@@ -869,6 +869,62 @@ func hasInjectedOCSession() bool {
 // mergeOCSessionID 把面板/脚本回传的 oc_session_id 合进 cfg。
 // present=false（请求体省略该键）时沿用现值，避免一次旧版面板回传就把会话静默清空——
 // 这个字段是免费层能否通过上游存在性校验的唯一开关，清掉等于退回全量 403。
+// configPostBody 是 POST /api/config 的请求体。会被「保存」动作静默清空的字段一律
+// 用指针：解到普通值时「键缺失」和「显式置空」是同一个零值，服务端区分不了，
+// 于是一次只带部分字段的回传就会把其余字段全量覆盖掉。出口配置被清空尤其致命——
+// config.json 里没了 socks5_proxies，容器重启后就是 exit=direct 直连出墙。
+type configPostBody struct {
+	AppConfig
+	ModelAlias         *map[string]ModelAlias `json:"model_alias"`
+	ReasoningEffortMap *map[string]string     `json:"reasoning_effort_map"`
+	Socks5Proxies      *[]Socks5Proxy         `json:"socks5_proxies"`
+	ActiveSocks5       *string                `json:"active_socks5"`
+	OCSessionID        *string                `json:"oc_session_id"`
+	KeyPool            *KeyPoolConfig         `json:"key_pool"`
+}
+
+// merge 把请求体合进 cfg：键缺失一律沿用现值，显式给出（哪怕是空数组/空串）才是「清空」。
+// normalizeConfig 会把 nil map 补成空 map，所以沿用必须发生在它之前。
+func (b configPostBody) merge(cfg *AppConfig) {
+	configMu.RLock()
+	if b.ModelAlias == nil {
+		cfg.ModelAlias = modelAlias
+	} else {
+		cfg.ModelAlias = *b.ModelAlias
+	}
+	if b.ReasoningEffortMap == nil {
+		cfg.ReasoningEffortMap = reasoningEffortMap
+	} else {
+		cfg.ReasoningEffortMap = *b.ReasoningEffortMap
+	}
+	configMu.RUnlock()
+	socks5Mu.RLock()
+	if b.Socks5Proxies == nil {
+		cfg.Socks5Proxies = socks5Proxies
+	} else {
+		cfg.Socks5Proxies = *b.Socks5Proxies
+	}
+	if b.ActiveSocks5 == nil {
+		cfg.ActiveSocks5 = activeSocks5
+	} else {
+		cfg.ActiveSocks5 = *b.ActiveSocks5
+	}
+	socks5Mu.RUnlock()
+	mergeOCSessionID(cfg, b.OCSessionID != nil, func() string {
+		if b.OCSessionID != nil {
+			return *b.OCSessionID
+		}
+		return ""
+	}())
+	// 面板没有 key 管理 UI，回传体里不会有 key_pool。不做「省略即沿用」的话，
+	// 运营在面板点一次保存就会把整池凭据静默清空，免费层随即退化成单凭据。
+	if b.KeyPool != nil {
+		cfg.KeyPool = b.KeyPool
+	} else {
+		cfg.KeyPool = currentKeyPool()
+	}
+}
+
 func mergeOCSessionID(cfg *AppConfig, present bool, val string) {
 	if present {
 		cfg.OCSessionID = val
@@ -5457,33 +5513,16 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(cfg)
 	case http.MethodPost:
-		// 用指针区分「字段省略」与「显式置空」：解到普通 string 时两者都是 ""，
-		// 会让面板清空操作失效。省略时沿用现值（免费层能否通过上游校验只取决于
-		// 这一个字段，一次旧版面板回传就会把它静默清空、服务随即全量 403）。
-		var body struct {
-			AppConfig
-			OCSessionID *string `json:"oc_session_id"`
-			// 同理：面板没有 key 管理 UI，回传体里不会有 key_pool。
-			// 不做「省略即沿用」的话，运营在面板点一次保存就会把整池凭据
-			// 静默清空 —— 免费层随即退化成单凭据，正是本卡要修的那个退化。
-			KeyPool *KeyPoolConfig `json:"key_pool"`
-		}
+		// 指针区分「字段省略」与「显式置空」：解到普通值时两者都是零值，
+		// 会让面板的清空操作失效；省略时沿用现值（一次旧版面板或脚本回传就会把
+		// 出口配置静默清空，服务随即绕过 mihomo 直连出墙）。见 configPostBody。
+		var body configPostBody
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, `{"error":"Invalid JSON"}`, http.StatusBadRequest)
 			return
 		}
 		cfg := body.AppConfig
-		mergeOCSessionID(&cfg, body.OCSessionID != nil, func() string {
-			if body.OCSessionID != nil {
-				return *body.OCSessionID
-			}
-			return ""
-		}())
-		if body.KeyPool != nil {
-			cfg.KeyPool = body.KeyPool
-		} else {
-			cfg.KeyPool = currentKeyPool()
-		}
+		body.merge(&cfg)
 		normalizeConfig(&cfg)
 		if err := saveConfig(configPath, cfg); err != nil {
 			http.Error(w, `{"error":"Failed to save config"}`, http.StatusInternalServerError)

@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -480,6 +483,96 @@ func TestConfigPostPreservesKeyPool(t *testing.T) {
 	if p == nil || !p.Enabled || len(p.Keys) != 1 {
 		t.Errorf("显式给出应原样解出，得到 %+v", p)
 	}
+}
+
+// TestConfigPostOmittedFieldsKeepCurrent 打的是真的 adminConfigHandler（含解码 +
+// 合并 + 落盘），不是把 body 结构体外抄一遍。请求体省略的字段必须沿用现值：
+// 少这层保护时，面板或脚本一次只带部分字段的回传就会把出口配置静默清空，
+// config.json 里没了 socks5_proxies，容器重启后即 exit=direct 直连出墙。
+func TestConfigPostOmittedFieldsKeepCurrent(t *testing.T) {
+	old := configPath
+	configPath = filepath.Join(t.TempDir(), "config.json")
+	defer func() { configPath = old }()
+
+	applyConfig(AppConfig{
+		ModelAlias:         map[string]ModelAlias{"step-5-preview": {TargetModel: "step-5-preview-free"}},
+		ReasoningEffortMap: map[string]string{"think": "high"},
+		Socks5Proxies:      []Socks5Proxy{{Addr: "mihomo:20819", Name: "OC出口"}},
+		ActiveSocks5:       "mihomo:20819",
+		OCSessionID:        testSession,
+	})
+	post := func(body string) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		adminConfigHandler(w, httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(body)))
+		if w.Code != http.StatusOK {
+			t.Fatalf("POST %s = %d: %s", body, w.Code, w.Body.String())
+		}
+	}
+	// 只带一个字段，其余全部省略 —— 面板没有 key 管理 UI、回传体残缺时就是这个形状
+	post(`{"oc_session_id":"` + testSession + `"}`)
+
+	socks5Mu.RLock()
+	proxies, active := socks5Proxies, activeSocks5
+	socks5Mu.RUnlock()
+	if active != "mihomo:20819" || len(proxies) != 1 || proxies[0].Addr != "mihomo:20819" {
+		t.Errorf("出口配置被静默清空：active_socks5=%q proxies=%+v", active, proxies)
+	}
+	configMu.RLock()
+	alias, effort := modelAlias, reasoningEffortMap
+	configMu.RUnlock()
+	if len(alias) != 1 || len(effort) != 1 {
+		t.Errorf("model_alias/reasoning_effort_map 被静默清空：alias=%v effort=%v", alias, effort)
+	}
+	// 落盘那份同样不能少：容器重启读的就是它，内存里保住不代表下次启动也保住
+	saved := map[string]any{}
+	if data, err := os.ReadFile(configPath); err != nil {
+		t.Fatalf("读回落盘配置失败: %v", err)
+	} else if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatalf("落盘配置不是合法 JSON: %v", err)
+	}
+	if saved["active_socks5"] != "mihomo:20819" {
+		t.Errorf("落盘 active_socks5=%v，出口配置没能扛过重启", saved["active_socks5"])
+	}
+	if list, _ := saved["socks5_proxies"].([]any); len(list) != 1 {
+		t.Errorf("落盘 socks5_proxies=%v，出口配置没能扛过重启", saved["socks5_proxies"])
+	}
+}
+
+// 沿用保护不能反过来越权：显式传空就是运营在面板上按了「清空」，必须真的清掉，
+// 否则这条保护就把出口代理变成不可撤销的了。
+func TestConfigPostExplicitEmptyStillClears(t *testing.T) {
+	old := configPath
+	configPath = filepath.Join(t.TempDir(), "config.json")
+	defer func() { configPath = old }()
+
+	applyConfig(AppConfig{
+		ModelAlias:    map[string]ModelAlias{"step-5-preview": {TargetModel: "step-5-preview-free"}},
+		Socks5Proxies: []Socks5Proxy{{Addr: "mihomo:20819", Name: "OC出口"}},
+		ActiveSocks5:  "mihomo:20819",
+		OCSessionID:   testSession,
+	})
+	w := httptest.NewRecorder()
+	adminConfigHandler(w, httptest.NewRequest(http.MethodPost, "/api/config",
+		strings.NewReader(`{"socks5_proxies":[],"active_socks5":""}`)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST = %d: %s", w.Code, w.Body.String())
+	}
+
+	socks5Mu.RLock()
+	proxies, active := socks5Proxies, activeSocks5
+	socks5Mu.RUnlock()
+	if active != "" || len(proxies) != 0 {
+		t.Errorf("显式置空应真的清空：active_socks5=%q proxies=%+v", active, proxies)
+	}
+	// 显式给了 model_alias 就该覆盖；没给的那次（上一个用例）不该影响这里
+	configMu.RLock()
+	alias := modelAlias
+	configMu.RUnlock()
+	if len(alias) != 1 {
+		t.Errorf("显式置空出口时不该顺带清掉 model_alias，得到 %v", alias)
+	}
+	applyConfig(AppConfig{OCSessionID: testSession})
 }
 
 // TestKeyPoolExtraAttemptsBound 换凭据的重试次数要有上界：池大不等于可以无限试，
