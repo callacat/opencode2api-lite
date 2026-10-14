@@ -2,6 +2,36 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- **免费层全量 403 FreeTierError（2026-10-14 上游二次收紧）**：上游把免费层
+  （Bearer public）从 `/zen` 整体迁到 `/inference`，并把门禁从「会话 ID 结构校验」
+  升级为「按官方 2.x 客户端指纹逐字段校验」。同日 jasonxu114514/opencode2api#83、
+  xbzbing/opencode2dsh#2、decolua/9router#4842 等多个下游独立复现并修复，
+  本仓按其已验证的形状镜像（分歧处以 83 号单变量消融为准）：
+  - 端点：匿名车道（`Bearer public`，含无 key_pool 的全部流量）改打
+    `https://opencode.ai/inference/v1/*`；keyed（oc_sk_*）车道保留在 `/zen`。
+    `fetchModels` 同步迁到 `/inference/v1/models`。
+  - UA：由 `opencode/<ver> ai-sdk/... runtime/...` 改为三段式
+    `opencode/latest/2.0.29/cli`（裸版本号与旧式 UA 都直接 403）。
+  - 头：补 `x-opencode-session-id`、`x-opencode-client: cli`、
+    `x-opencode-project`（裸 40hex）；去掉 `x-session-id`；不发送
+    `x-opencode-request`（该头现身即拒）。`x-session-affinity`/`X-Session-Id` 保留。
+  - 工具：官方认识的工具名必须携带真实定义（`opencode_tools.json`，抄自官方
+    2.x 客户端，经 #83 抓包固化）——同名桩/截断描述都会被拒。核心五件改为
+    shell/edit/glob/grep/read（2.x 命名），缺失补齐、同名桩整体替换；
+    不认识的名字原样透传。`tool_choice:"none"` 会被拒，发送前剔除。
+  - 会话 ID 反转时间戳编码（v1.0.3 引入）仍是 `ses_*` 值的必要形状，保留不变。
+- `ocFreeTierHint` 诊断文案更新为 2026-10-14 版门禁清单，避免下次 403 再被
+  旧的两道门描述误导。
+
+### 测试
+
+- `TestFreeTierToolsGate` 契约更新：核心五件必须补齐、同名桩替换为真实定义、
+  未知名保留（新增 shell 桩替换断言）。
+
 ## [v1.0.4] - 2026-10-14
 
 ### 修复

@@ -267,11 +267,13 @@ func TestMergeOCSessionID(t *testing.T) {
 	}
 }
 
-// TestFreeTierToolsGate 钉住免费层的第二道门：请求体的 tools 必须同时含 bash 与 read。
+// TestFreeTierToolsGate 钉住免费层门禁的工具侧契约（2026-10-14 版）：
 //
-// 这道门与 x-session-id 相互独立 —— 会话有效但 tools 被「精简」掉，上游照样回 403
-// FreeTierError（2026-10-13 实测：无 tools / 缺 read / 缺 bash 均 403，bash+read 与四件套 200）。
-// 修 403 时极易只查会话，故在此把四种 tools 形态都钉住：谁把补齐逻辑改坏，这里就红。
+//   - 核心五件 shell/edit/glob/grep/read 必须补齐（缺任一件即 403）；
+//   - 官方认识的名字（如 shell）若客户端给了桩定义，会被真实定义替换——
+//     描述子串匹配、参数逐字节相等的要求下，桩本身就是 403 信号；
+//   - 官方不认识的名字（get_weather / bash 等）原样保留（bash 在 2.x 改名
+//     shell，门禁按认识的名字校验，bash 不在其列则按未知工具放行）。
 func TestFreeTierToolsGate(t *testing.T) {
 	names := func(body map[string]any) map[string]bool {
 		got := map[string]bool{}
@@ -298,7 +300,7 @@ func TestFreeTierToolsGate(t *testing.T) {
 		{"[]map[string]any 形态（仅扫描兼容，合并不保留）", map[string]any{
 			"tools": []map[string]any{{"type": "function", "function": map[string]any{"name": "get_weather"}}},
 		}, nil},
-		{"客户端已自带 bash 但缺 read", map[string]any{
+		{"客户端已自带 bash 但缺 core", map[string]any{
 			"tools": []Tool{{Type: "function", Function: ToolFunction{Name: "bash"}}},
 		}, []string{"bash"}},
 	}
@@ -306,15 +308,38 @@ func TestFreeTierToolsGate(t *testing.T) {
 	for _, c := range cases {
 		ensureFreeTierTools(c.body)
 		got := names(c.body)
-		if !got["bash"] || !got["read"] {
-			t.Errorf("%s: 补齐后应同时含 bash 与 read，实际 %v", c.name, got)
+		for _, core := range []string{"shell", "edit", "glob", "grep", "read"} {
+			if !got[core] {
+				t.Errorf("%s: 补齐后缺核心工具 %q，实际 %v", c.name, core, got)
+			}
 		}
-		// 客户端自带的工具不能被桩四件套挤掉（历史上真出过：模型抱怨「看不到 get_weather」）
+		// 客户端自带的工具不能被核心五件挤掉（历史上真出过：模型抱怨「看不到 get_weather」）
 		for _, k := range c.keep {
 			if !got[k] {
 				t.Errorf("%s: 补齐后丢了客户端原有工具 %q，实际 %v", c.name, k, got)
 			}
 		}
+	}
+
+	// 同名桩必须被真实定义替换：上游对 description 做子串匹配、对 parameters 逐字节比对。
+	stub := map[string]any{
+		"tools": []Tool{{Type: "function", Function: ToolFunction{
+			Name: "shell", Description: "stub", Parameters: map[string]any{"type": "object"},
+		}}},
+	}
+	ensureFreeTierTools(stub)
+	var description string
+	switch tools := stub["tools"].(type) {
+	case []any:
+		for _, raw := range tools {
+			m, _ := raw.(Tool)
+			if m.Function.Name == "shell" {
+				description = m.Function.Description
+			}
+		}
+	}
+	if genuine, ok := genuineToolDef("shell"); !ok || description != genuine.Description {
+		t.Errorf("shell 桩应被替换为真实定义，得到 %q", description)
 	}
 }
 

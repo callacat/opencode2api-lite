@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	_ "embed" // opencode_tools.json 真实工具定义
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -499,25 +500,34 @@ var (
 
 // ======================== 上游请求头指纹 ========================
 //
-// 上游 /zen/v1/chat/completions 对免费层模型做指纹校验，必要条件：
+// 2026-10-14 上游把免费层（Bearer public）从 /zen 整体迁到 /inference，
+// 门禁从「会话 ID 结构校验」升级为「按官方 2.x 客户端指纹逐字段校验」。
+// 逐项消融后的形状（jasonxu114514/opencode2api#83、xbzbing/opencode2dsh#2
+// 同日独立复现；/zen 老端点对免费层即使逐字节克隆客户端请求也 403）：
 //
-//  1. 2026-10 起：x-session-id 必须是 **OpenCode 客户端真实创建过的会话**。
-//     上游从「格式校验」（2026-09-18：ses_ + 12 位小写十六进制 + 14 位 [A-Za-z0-9]）
-//     升级为「存在性校验」——编造的 ses_* 一律 403 FreeTierError。携带真实
-//     oc_sk_* API key、或补齐 x-opencode-client/project/request/session/session-id
-//     新协议头，均无法让编造会话通过（2026-10-13 实测对照矩阵）。
-//     因此会话改由 config.json 的 oc_session_id / 环境变量 OC_SESSION_ID 注入；
-//     未注入时才退回编造，该路径必然 403，仅保留以维持旧行为可观测并在启动时告警。
-//     x-session-affinity 官方客户端会带（与 x-session-id 同值），一并带上更贴近真实客户端。
-//  2. 请求 body 的 tools 必须同时含 bash 与 read（ddmin 实测：缺任一即 403，两者齐全即可，
-//     glob/grep 非必需）。缺失时由 ensureFreeTierTools 自动补齐。
-//  3. 请求 body 必须 stream:true（stream:false 直接 403）。非流式请求由代理
-//     以上游流式发出并用 aggregateOpenAIStream 本地聚合还原，客户端感知不变。
+//  1. 端点：免费层（keyless）走 /inference/v1/*；keyed（oc_sk_*）车道仍在 /zen。
+//  2. UA 必须是三段式 "opencode/<channel>/<version>/<name>"；裸版本号或旧
+//     "opencode/<ver> (os arch; runtime)" 形都会被拒 → 403 FreeTierError。
+//  3. x-opencode-session-id 必须带（值为反转时间戳 ses_*，见 newOCSessionID）；
+//     自造的相关头（如 x-opencode-request）现身即 403。
+//  4. x-opencode-project 为裸 40 位小写 hex（形如 "prj_*" 的前缀形即拒）。
+//  5. tools 里被官方认识的名字必须带真实定义（description 子串匹配、parameters
+//     逐字节相等）——占位桩本身就是拒绝信号；核心五件 shell/edit/glob/grep/read
+//     由 ensureFreeTierTools 用真实定义补齐、已声明的同名桩替换。
+//  6. body 必须 stream:true；非流式客户端由代理聚合成非流式返回，感知不变。
 //
-// UA 后缀（ai-sdk/... runtime/...）实测非必需（纯 opencode/<ver> 也能过），但保留以贴近真实客户端。
-//
-// User-Agent 必须能解析出 opencode/<version>，且 version >= minOCVersion。
-// 低于该版本上游返回 426 Upgrade Required。
+// 10-13 时代的要求/容忍项已失效：x-session-id 头、「会话是否真实注册过」。
+const (
+	// 免费层（keyless，Bearer public）车道上游
+	ocInferenceBase = "https://opencode.ai/inference"
+	// keyed（oc_sk_*）车道上游
+	ocZenBase = "https://opencode.ai/zen"
+	// 官方 CLI 2.x 三段式 UA，逐字符是门禁的一部分
+	ocClientUA = "opencode/latest/2.0.29/cli"
+)
+
+// minOCVersion / defaultOCVersion 只服务于 fetchOCVersion 的版本号下限校正（日志展示用），
+// 不再参与任何门禁判定。
 const (
 	minOCVersion     = "1.17.0"
 	defaultOCVersion = "1.18.31"
@@ -682,9 +692,19 @@ var (
 )
 
 func fetchModels() ([]ModelInfo, error) {
-	req, _ := http.NewRequest("GET", "https://opencode.ai/zen/v1/models", nil)
+	// 模型目录同属免费层：2026-10-14 起随业务流迁到 /inference，并要全套指纹头
+	// （/zen/v1/models 裸头虽仍 200，但那只是遗留只读面，不代表业务车道）。
+	initOCSession() // 保证 ocProjectID 已生成——空 project 头会撞免费层指纹门
+	req, _ := http.NewRequest("GET", ocInferenceBase+"/v1/models", nil)
+	sid := ocCurrentSessionID()
 	req.Header.Set("Authorization", "Bearer public")
-	req.Header.Set("x-opencode-session", ocSessionID)
+	req.Header.Set("User-Agent", ocClientUA)
+	req.Header.Set("x-opencode-client", "cli")
+	req.Header.Set("x-opencode-session", sid)
+	req.Header.Set("x-opencode-session-id", sid)
+	req.Header.Set("x-session-affinity", sid)
+	req.Header.Set("X-Session-Id", sid)
+	req.Header.Set("x-opencode-project", ocProjectID)
 	client, _, err := getHTTPClient(req.Context())
 	if err != nil {
 		return nil, err
@@ -728,26 +748,19 @@ var (
 	ocRefreshCmd string
 )
 
-// ocFreeTierHint 点名免费层的**两道独立的门**，供 403 诊断日志引用。
-//
-// 2026-10-13 独立复核实测（同一 pinned 会话、同一出口，只变 tools，n=2/组）：
-//
-//	tools = [bash, read]                 → 200
-//	tools = bash/glob/grep/read 四件套   → 200
-//	请求体无 tools 字段                  → 403
-//	tools = bash/glob/grep（缺 read）    → 403
-//	tools = glob/grep/read（缺 bash）    → 403
-//
-// 会话对了但 tools 被「精简」掉，照样全量 403。403 本身不区分是哪一道门，
-// 排查时极易只盯着 session，把时间花错地方。
+// ocFreeTierHint 点名免费层门禁的校验项（2026-10-14 版），供 403 诊断日志引用
 func ocFreeTierHint() string {
-	return "免费层有两道独立的门：(1) x-session-id 必须是真实注册过的会话（见 oc_session_id）；" +
-		"(2) 请求体 tools 必须同时含 bash 与 read（由 ensureFreeTierTools 补齐，勿精简）"
+	return "免费层门禁（2026-10-14 版，任一不合即 403）：" +
+		"(1) 端点 /inference/v1；(2) UA 三段式 " + ocClientUA + "；" +
+		"(3) x-opencode-session-id=反转时间戳 ses_*（见 newOCSessionID）；" +
+		"(4) x-opencode-project 为裸 40hex，勿带 x-opencode-request 头；" +
+		"(5) tools 含 shell/edit/glob/grep/read 且同名工具是官方真实定义（ensureFreeTierTools 保证）；" +
+		"(6) body stream:true"
 }
 
 // logFreeTierRejection 在上游回 403 FreeTierError 时无条件记一行诊断。
 //
-// 403 是硬失败、不是临时故障，且两道门任一失效都表现为它，故不受 debugMode 约束 ——
+// 403 是硬失败、不是临时故障，且几道门任一失效都表现为它，故不受 debugMode 约束 ——
 // 生产默认不开 -debug，此前这类 403 在日志里完全不可见。
 func logFreeTierRejection(ctx context.Context, modelID string, status int, body []byte) {
 	if status != http.StatusForbidden || !bytes.Contains(body, []byte("FreeTierError")) {
@@ -2040,47 +2053,45 @@ func buildUpstreamBody(req *OpenAIRequest) map[string]any {
 	return convertRequest(req)
 }
 
-// freeTierRequiredTools 上游 2026-09-18 新增校验：免费层请求 body 的 tools 必须包含
-// bash / glob / grep / read 四件工具（顺序、描述、额外工具均无所谓）。
-// 客户端（cherry studio / codex / 普通聊天）通常不带全这些工具，这里准备最小定义，
-// 由 ensureFreeTierTools 把缺失的补进请求。描述与参数结构可任意，仅需名字命中。
-var freeTierRequiredTools = []map[string]any{
-	{"type": "function", "function": map[string]any{
-		"name":        "bash",
-		"description": "Run a shell command and return its output",
-		"parameters": map[string]any{
-			"type":       "object",
-			"properties": map[string]any{"command": map[string]any{"type": "string", "description": "The shell command to execute"}},
-			"required":   []string{"command"},
-		},
-	}},
-	{"type": "function", "function": map[string]any{
-		"name":        "glob",
-		"description": "Find files matching a glob pattern",
-		"parameters": map[string]any{
-			"type":       "object",
-			"properties": map[string]any{"pattern": map[string]any{"type": "string", "description": "The glob pattern to match files against"}},
-			"required":   []string{"pattern"},
-		},
-	}},
-	{"type": "function", "function": map[string]any{
-		"name":        "grep",
-		"description": "Search file contents with a regular expression",
-		"parameters": map[string]any{
-			"type":       "object",
-			"properties": map[string]any{"pattern": map[string]any{"type": "string", "description": "The regular expression pattern to search for"}},
-			"required":   []string{"pattern"},
-		},
-	}},
-	{"type": "function", "function": map[string]any{
-		"name":        "read",
-		"description": "Read the contents of a file",
-		"parameters": map[string]any{
-			"type":       "object",
-			"properties": map[string]any{"file_path": map[string]any{"type": "string", "description": "The path of the file to read"}},
-			"required":   []string{"file_path"},
-		},
-	}},
+// 免费层（2026-10-14 起 /inference 车道）对「官方认识的工具名」校验真实定义：
+// description 子串匹配、parameters 逐字节相等，占位桩/截断定义本身就是 403
+// FreeTierError 信号。 definitions 抄自官方 OpenCode 客户端（经
+// jasonxu114514/opencode2api#83 抓包固化，逐字节对齐），文件即唯一事实源。
+//
+//go:embed opencode_tools.json
+var genuineToolsJSON []byte
+
+var (
+	genuineToolsOnce sync.Once
+	genuineTools     map[string]ToolFunction
+)
+
+// genuineToolDef 返回官方客户端该名字的真实定义；名字不认识时 ok=false（调用方不得动它）。
+func genuineToolDef(name string) (ToolFunction, bool) {
+	genuineToolsOnce.Do(func() {
+		m := map[string]ToolFunction{}
+		if err := json.Unmarshal(genuineToolsJSON, &m); err != nil {
+			// 嵌入文件损坏是构建期问题；运行期退化为「不认识任何名字」，
+			// 等价于关闭替换与补齐，行为和加门禁前的老版本一致。
+			m = map[string]ToolFunction{}
+		}
+		genuineTools = m
+	})
+	def, ok := genuineTools[name]
+	return def, ok
+}
+
+// freeTierCoreToolNames 免费层要求在场的代理型核心工具（OpenCode 2.x 命名）。
+var freeTierCoreToolNames = []string{"shell", "edit", "glob", "grep", "read"}
+
+// genuineChatTool 组装一个 chat 协议形态（type:function）的真实工具定义。
+func genuineChatTool(name string) map[string]any {
+	def, _ := genuineToolDef(name)
+	return map[string]any{"type": "function", "function": map[string]any{
+		"name":        name,
+		"description": def.Description,
+		"parameters":  def.Parameters,
+	}}
 }
 
 // toolNameOf 从工具的任意形态里取出名字：可能是 Tool 结构体（convertRequest 直接构造的形态），
@@ -2107,34 +2118,52 @@ func toolNameOf(raw any) string {
 // 关键：tools 有两种形态 —— convertRequest 直接构造时是 []Tool，经过 JSON 往返时是 []any。
 // 只认一种会**静默失败**：曾经只断言 []any，[]Tool 进来时 existing 为空、判定四件全缺，
 // 于是把客户端自带的全部工具替换掉、只留四个桩 —— 表现为模型抱怨"看不到 get_weather 这类工具"。
+// ensureFreeTierTools 把请求体 tools 修成官方 2.x 客户端形态（2026-10-14 新门禁）：
+//   - 官方认识的名字 → 定义整体替换为真实定义（桩、截断描述、篡改 schema 都会 403）；
+//   - 缺核心五件（shell/edit/glob/grep/read）→ 用真实定义补齐；
+//   - 官方不认识的名字原样保留，客户端自有 function calling 不受影响。
+//
+// 关键：tools 有两种形态 —— convertRequest 直接构造时是 []Tool，经过 JSON 往返时是 []any。
+// 只认一种会**静默失败**：曾经只断言 []any，[]Tool 进来时 existing 为空、判定全缺，
+// 于是把客户端自带的全部工具替换掉、只留四个桩 —— 表现为模型抱怨"看不到 get_weather 这类工具"。
 func ensureFreeTierTools(bodyMap map[string]any) {
 	existing := make(map[string]bool, 8)
 	switch tools := bodyMap["tools"].(type) {
 	case []Tool:
 		for i := range tools {
-			if name := tools[i].Function.Name; name != "" {
-				existing[name] = true
+			name := tools[i].Function.Name
+			if name == "" {
+				continue
+			}
+			existing[name] = true
+			if def, ok := genuineToolDef(name); ok {
+				tools[i].Function.Description = def.Description
+				tools[i].Function.Parameters = def.Parameters
 			}
 		}
 	case []any:
 		for _, raw := range tools {
-			if name := toolNameOf(raw); name != "" {
-				existing[name] = true
+			name := toolNameOf(raw)
+			if name == "" {
+				continue
 			}
+			existing[name] = true
+			replaceWithGenuineDef(raw, name)
 		}
 	case []map[string]any:
 		for _, t := range tools {
-			if name := toolNameOf(t); name != "" {
-				existing[name] = true
+			name := toolNameOf(t)
+			if name == "" {
+				continue
 			}
+			existing[name] = true
+			replaceWithGenuineDef(t, name)
 		}
 	}
-	missing := make([]any, 0, len(freeTierRequiredTools))
-	for _, tool := range freeTierRequiredTools {
-		fn, _ := tool["function"].(map[string]any)
-		name, _ := fn["name"].(string)
-		if name != "" && !existing[name] {
-			missing = append(missing, tool)
+	missing := make([]any, 0, len(freeTierCoreToolNames))
+	for _, name := range freeTierCoreToolNames {
+		if !existing[name] {
+			missing = append(missing, genuineChatTool(name))
 		}
 	}
 	if len(missing) == 0 {
@@ -2153,6 +2182,32 @@ func ensureFreeTierTools(bodyMap map[string]any) {
 	default:
 		bodyMap["tools"] = append([]any(nil), missing...)
 	}
+}
+
+// replaceWithGenuineDef 把一个 map 形态工具条目的定义替换为官方真实定义。
+// 非 "function" 子键形态（不在 chat 协议里出现过的意外形状）整条替换。
+func replaceWithGenuineDef(raw any, name string) {
+	def, ok := genuineToolDef(name)
+	if !ok {
+		return
+	}
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return
+	}
+	fn, ok := m["function"].(map[string]any)
+	if !ok {
+		fresh := genuineChatTool(name)
+		for k := range m {
+			delete(m, k)
+		}
+		for k, v := range fresh {
+			m[k] = v
+		}
+		return
+	}
+	fn["description"] = def.Description
+	fn["parameters"] = def.Parameters
 }
 
 // ======================== Anthropic 格式兼容 ========================
@@ -2532,28 +2587,38 @@ func convertResponse(data []byte, modelID string) ([]byte, error) {
 // buildOCRequest 用已经序列化好的请求体构造上游请求。
 // 每次重试都会重新 NewRequest（bytes.Reader 游标独立），但不再重新 Marshal 整个 body。
 // 第二个返回值是本次用掉的凭据编号 key_id，只进诊断日志，绝不含凭据明文。
+//
+// 头组逐字符镜像官方 2.x 客户端（jasonxu114514/opencode2api#83 今日实测消融）：
+// 缺 x-opencode-session-id、UA 换形、project 带 prj_ 前缀、多带 x-opencode-request，
+// 任何一项单独出现都 403 FreeTierError；按手指纹一致时过门与凭据有无无关。
 func buildOCRequest(ctx context.Context, bodyBytes []byte) (*http.Request, string, error) {
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://opencode.ai/zen/v1/chat/completions", bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
 	// key_pool 命中就用池内凭据；未启用或池空一律回落到 Bearer public，
 	// 保证没配 key_pool 的部署行为与引入本字段之前逐字节一致。
 	auth, keyID := "public", ""
 	if k, ok := pickOCKey(ocCurrentSessionID()); ok {
 		auth, keyID = k.val, k.id
 	}
-	req.Header.Set("Authorization", "Bearer "+auth)
-	req.Header.Set("User-Agent", fmt.Sprintf("opencode/%s ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14", ocClientVer))
-	// 2026-10 上游把 x-session-id 的校验从「格式」改成「会话是否真实存在」：
-	// 编造的 ses_* 一律 403 FreeTierError，真实 API key 与新协议头都救不了。
-	// 因此这里统一走 ocCurrentSessionID —— 有注入的真实会话就用，没有才编造
-	// （兜底路径必然 403，启动时会告警提示配置 oc_session_id）。
+	// 免费层（keyless）车道 2026-10-14 整体迁到 /inference；keyed 车道仍在 /zen。
+	base := ocZenBase
+	if auth == "public" {
+		base = ocInferenceBase
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", base+"/v1/chat/completions", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, "", err
+	}
 	sid := ocCurrentSessionID()
-	req.Header.Set("x-session-id", sid)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "Bearer "+auth)
+	req.Header.Set("User-Agent", ocClientUA)
+	req.Header.Set("x-opencode-client", "cli")
+	req.Header.Set("x-opencode-session", sid)
+	req.Header.Set("x-opencode-session-id", sid)
 	req.Header.Set("x-session-affinity", sid)
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Session-Id", sid)
+	// ocProjectID 由 randomHex(40) 生成，裸 40 位小写 hex 即官方期望形状
+	req.Header.Set("x-opencode-project", ocProjectID)
 	return req, keyID, nil
 }
 
@@ -2715,6 +2780,10 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 	// 只使用调用方指定的模型；失败仅按代理/限流重试，不切换到其他模型
 	bodyMap["model"] = modelID
 	ensureFreeTierTools(bodyMap)
+	// tool_choice:"none" 会被免费层门禁直接拒（只剩省略/auto 两种合法姿势）
+	if tc, _ := bodyMap["tool_choice"].(string); tc == "none" {
+		delete(bodyMap, "tool_choice")
+	}
 	// 上游 2026-09-18 新校验：免费层必须 stream:true（stream:false 直接 403 FreeTierError）。
 	// 非流式请求也以上游流式发出，成功后由 aggregateOpenAIStream 本地还原为完整 JSON，
 	// 客户端拿到的仍是非流式 chat.completion，感知不变。
@@ -2815,6 +2884,10 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 	// 只使用调用方指定的模型；失败仅按代理/限流重试，不切换到其他模型
 	bodyMap["model"] = modelID
 	ensureFreeTierTools(bodyMap)
+	// tool_choice:"none" 会被免费层门禁直接拒（只剩省略/auto 两种合法姿势）
+	if tc, _ := bodyMap["tool_choice"].(string); tc == "none" {
+		delete(bodyMap, "tool_choice")
+	}
 
 	// 只序列化一次，重试时复用同一份字节（循环体内不再改动 body）
 	bodyBytes, err := json.Marshal(bodyMap)
@@ -5959,7 +6032,7 @@ func main() {
 	log.Printf("===================")
 	log.Printf("版本:     %s", version)
 	log.Printf("端口:     %s", port)
-	log.Printf("上游:     https://opencode.ai/zen/v1/chat/completions (API)")
+	log.Printf("上游:     %s/v1/chat/completions (API，免费层)", ocInferenceBase)
 	log.Printf("模型：  异步加载中")
 	log.Printf("别名：  %d", len(modelAlias))
 

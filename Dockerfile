@@ -3,7 +3,7 @@ FROM golang:1.26-alpine AS build
 WORKDIR /src
 # 版本号由 docker-ghcr 工作流经 build-arg 注入（tag v1.0.0 → 1.0.0；main 分支 → dev）
 ARG VERSION=dev
-COPY go.mod main.go main_test.go ./
+COPY go.mod main.go main_test.go opencode_tools.json ./
 # CGO 纯静态 + -trimpath/-s/-w 缩体积；-X main.version 写入真实版本（版本单一来源 = git tag）
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/opencode2api-lite .
 
