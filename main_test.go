@@ -186,6 +186,48 @@ func TestRefreshOCSessionOnce(t *testing.T) {
 	}
 }
 
+// TestRefreshOCSessionKeepsProxyAndKeyPool 钉住续命写回 config.json 时不丢出口配置。
+// 2026-10-14 14:18 实测复发：续命自己拼一个 4 字段 AppConfig 落盘，少填的键按零值
+// 把整份文件覆盖掉，socks5_proxies/active_socks5/key_pool 一并消失。运行中的服务照旧
+// 走 OC出口、健康检查全绿，直到某次重启才退化成 exit=direct 直连出墙。
+func TestRefreshOCSessionKeepsProxyAndKeyPool(t *testing.T) {
+	oldPath := configPath
+	configPath = filepath.Join(t.TempDir(), "config.json")
+	defer func() {
+		configPath = oldPath
+		applyConfig(AppConfig{Socks5Proxies: []Socks5Proxy{}, ActiveSocks5: ""})
+		ocRefreshCmd = ""
+	}()
+
+	const fresh = "ses_0123456789abABCDEFGHIJKLMN"
+	applyConfig(AppConfig{
+		ModelAlias:    map[string]ModelAlias{"step-5-preview": {TargetModel: "step-5-preview-free"}},
+		Socks5Proxies: []Socks5Proxy{{Addr: "mihomo:20819", Name: "OC出口"}},
+		ActiveSocks5:  "mihomo:20819",
+		OCSessionID:   testSession,
+		KeyPool:       &KeyPoolConfig{Enabled: true, Keys: []KeyEntry{{ID: "k1", Key: "oc_sk_test"}}},
+	})
+	ocRefreshCmd = "echo 'message=created id=" + fresh + "'"
+	if !refreshOCSessionOnce() {
+		t.Fatal("命令输出含合法 ses_* 时应刷新成功")
+	}
+
+	saved := loadConfig(configPath)
+	if saved.OCSessionID != fresh {
+		t.Errorf("续命本意就是换会话，oc_session_id=%q 期望 %q", saved.OCSessionID, fresh)
+	}
+	if saved.ActiveSocks5 != "mihomo:20819" || len(saved.Socks5Proxies) != 1 {
+		t.Errorf("续命把出口配置写丢了：active_socks5=%q socks5_proxies=%+v",
+			saved.ActiveSocks5, saved.Socks5Proxies)
+	}
+	if saved.KeyPool == nil || len(saved.KeyPool.Keys) != 1 {
+		t.Errorf("续命把 key_pool 写丢了：%+v", saved.KeyPool)
+	}
+	if len(saved.ModelAlias) != 1 {
+		t.Errorf("续命把 model_alias 写丢了：%v", saved.ModelAlias)
+	}
+}
+
 // TestNormalizeConfigTrimsSession 确认配置里的会话 id 会被去空白，
 // 避免面板里误粘的换行/空格直接导致上游 403。
 func TestNormalizeConfigTrimsSession(t *testing.T) {

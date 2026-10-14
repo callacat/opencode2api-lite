@@ -791,12 +791,14 @@ func refreshOCSessionOnce() bool {
 	cmd2 := ocRefreshCmd
 	configMu.Unlock()
 	log.Printf("会话已自动续命: %s", sid)
-	if err := saveConfig(configPath, AppConfig{
-		ModelAlias:          modelAlias,
-		ReasoningEffortMap:  reasoningEffortMap,
-		OCSessionID:         sid,
-		OCSessionRefreshCmd: cmd2,
-	}); err != nil {
+	// 落盘必须带**全量**字段：这里自建 AppConfig 字面量只填几个键时，
+	// 少填的键会按零值整份覆盖掉 config.json —— socks5_proxies/active_socks5 一没，
+	// 下次重启就是 exit=direct 绕开 mihomo 直连出墙，而健康检查一路报绿（2026-10-14 14:18 复发）。
+	// 走 configPostBody.merge() 复用「省略即沿用现值」：本次只改会话，
+	// 其余字段一律从内存现值回填。POST /api/config 同一条保护。
+	cfg := AppConfig{OCSessionRefreshCmd: cmd2}
+	configPostBody{OCSessionID: &sid}.merge(&cfg)
+	if err := saveConfig(configPath, cfg); err != nil {
 		log.Printf("警告: 续命后的会话写回 config 失败: %v", err)
 	}
 	return true

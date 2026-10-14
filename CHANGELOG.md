@@ -6,6 +6,24 @@
 
 ### 修复
 
+- **会话续命每 30 分钟把 `config.json` 整份覆盖，出口配置被抹成零值**（现网复发，2026-10-14 14:18）。
+  这是上面那条「出口配置被静默清空」的**另一条独立写路径**，v1.0.3 的修复没覆盖到，
+  于是在生产上又发了一次：13:37:35 / 13:47:59 / 14:18:08 三次。
+  - 根因在 `refreshOCSessionOnce`：它自己拼一个只填 4 个键的 `AppConfig` 字面量去
+    `saveConfig`，没填的键按零值整份覆盖 —— `socks5_proxies` / `active_socks5` / `key_pool`
+    一起消失。`model_alias` / `reasoning_effort_map` 是当时唯一还在字面量里的两个键，
+    正好与现网残留的键完全对上，反向印证。
+  - 危险在于**潜伏期**：运行中的容器启动时已把配置读进内存，日志里的 `exit=` 全程还是
+    `OC出口 (mihomo:20819)`，健康检查一路报绿。故障要到下一次重启（发版 / 崩溃 / 宿主重启）
+    才显形，那时 28882 已经变成 `exit=direct` 直连出墙 —— 与 CMP-38 同一形状的事故。
+  - 改法不新增状态：落盘改走 `configPostBody.merge()`，复用 POST /api/config 那条
+    「省略即沿用现值」的保护，本次只提交新的 `oc_session_id`，其余字段从内存现值回填。
+    另两处 `saveConfig` 调用点（面板 POST、启动落盘）本来就是全量的，不受影响。
+  - 自检 21 → 22。新增 `TestRefreshOCSessionKeepsProxyAndKeyPool` 打在
+    「续命落盘后从磁盘读回」这个真实边界上，钉住 `active_socks5` / `socks5_proxies` /
+    `key_pool` / `model_alias` 都不丢；已做变异验证：退回 4 字段字面量该用例转红，
+    报错正是 `active_socks5="" socks5_proxies=[]`、`key_pool=<nil>`。
+
 - **出口配置被静默清空，导致服务绕过 mihomo 直连出墙**（现网事故，2026-10-14）。
   `config.json` 里的 `socks5_proxies` / `active_socks5` 不知何时被清成空，容器日志随即
   从 `exit=OC出口 (mihomo:20819)` 变成 `exit=direct` —— 全量绕开代理直连，请求来源 IP
