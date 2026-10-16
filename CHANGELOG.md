@@ -6,6 +6,24 @@
 
 ### 修复
 
+- **403 形态的瞬时上游错误不进自愈重试，且零日志**（CMP-86，缺口来自 CMP-46 定位）。
+  上游把 `Endpoint is unavailable`（`type:"server_error"`）有时回 429、有时回 403，
+  body 逐字相同。429 形态本来就换出口/换凭据重试；403 形态却直接落透传分支 ——
+  不换出口、不换凭据，且因 `[upstream error]` 只在 `-debug` 下打而**完全不可观测**。
+  出口一旦抽到持续报错的节点，钉死模式下会无限期返回 403
+  （CMP-46 实测：20818 腿连打 4 发全 403，同一时刻 20819 腿 2/2 全 200）。
+  - 新增窄判据 `isRetryableQuotaUpstream`：`429 || (403 && body 含 "Endpoint is unavailable")`。
+    **只认 message**，不认整个 `type:"server_error"` —— 同 type 下还有
+    `Model is unavailable`（模型已下线，实质永久错误，实测回 400），拖进重试只会
+    白烧凭据与出口；400 本轮不纳入。
+  - 两个入口（`callOpenCodeAPI` / `callOpenCodeAPIStream`）改判据；循环体复用现有动作
+    （`advanceOCKey` + `rotateSocks5OnRateLimit`），重试上限沿用
+    `socks5RateLimitAttemptCount()` + `keyPoolExtraAttempts()`，不引入无界重试；
+    配额类判据只在 429 下生效（403 形态没有「额度耗尽」语义，永远换 key）；
+    试满后仍把**上游原始 status/body** 透传客户端（不改写成 502）。
+  - 可观测性（独立缺口）：未进任何重试分支的上游非 2xx 一律**无条件**记一行
+    （status + body），不再受 `-debug` 约束 —— 生产默认不开 `-debug`，此前这类错误
+    在日志里完全不可见。
 - **免费层全量 403 FreeTierError（2026-10-14 上游二次收紧）**：上游把免费层
   （Bearer public）从 `/zen` 整体迁到 `/inference`，并把门禁从「会话 ID 结构校验」
   升级为「按官方 2.x 客户端指纹逐字段校验」。同日 jasonxu114514/opencode2api#83、
@@ -31,6 +49,12 @@
 
 - `TestFreeTierToolsGate` 契约更新：核心五件必须补齐、同名桩替换为真实定义、
   未知名保留（新增 shell 桩替换断言）。
+- `TestIsRetryableQuotaUpstream` / `TestTransient403RetriesThenPassesThrough` /
+  `TestTransient403RetriesStream` / `TestForbiddenNonTransientNotRetried`：钉住
+  403 瞬时类换出口/换凭据重试到预算用尽且透传上游原始 403（非流式与流式两个入口各一条）、
+  403 `FreeTierError` 与 400 `Model is unavailable` 都不重试；429 行为由既有
+  `TestQuotaClass429StopsAtOneUpstreamCall` / `TestCredential429StillRotates` 回归。
+  已做变异验证：摘掉 403 那一臂后前三条用例转红。
 
 ## [v1.0.4] - 2026-10-14
 

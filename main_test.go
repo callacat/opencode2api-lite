@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -795,5 +796,113 @@ func TestQuotaBreakerFastFailsAfterThreshold(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "FreeUsageLimitError") {
 		t.Fatalf("熔断快失败的 body 应与上游同形，得到 %s", body)
+	}
+}
+
+// ======================== 瞬时上游错误的 403 形态（CMP-86） ========================
+//
+// 上游把 `Endpoint is unavailable` 有时回 429、有时回 403，body 逐字相同（CMP-46）。
+// 403 形态原先落透传分支：不换出口、不换凭据、且零日志 —— 出口抽到持续报错的节点
+// 会永久卡死。判据必须只认 message：同一个 type:"server_error" 下 `Model is unavailable`
+// 是模型已下线的永久错误，拖进重试只会白烧额度。
+
+const transientBody = `{"error":{"type":"server_error","message":"Upstream request failed: Endpoint is unavailable."}}`
+const modelGoneBody = `{"error":{"type":"server_error","message":"Model is unavailable."}}`
+
+func TestIsRetryableQuotaUpstream(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{"429 一律重试", 429, `{"error":{"message":"slow down"}}`, true},
+		{"403 + Endpoint is unavailable（瞬时）", 403, transientBody, true},
+		{"403 + FreeTierError（会话门，重试无意义）", 403, quotaTestBody, false},
+		{"403 + 其他 body", 403, `{"error":{"message":"forbidden"}}`, false},
+		{"400 + Model is unavailable（模型已下线，永久错误）", 400, modelGoneBody, false},
+		{"200 正常响应", 200, `{"ok":true}`, false},
+	}
+	for _, c := range cases {
+		if got := isRetryableQuotaUpstream(c.status, []byte(c.body)); got != c.want {
+			t.Errorf("%s：期望 %v，得到 %v", c.name, c.want, got)
+		}
+	}
+}
+
+func writeTransient403(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	w.Write([]byte(transientBody))
+}
+
+// TestTransient403RetriesThenPassesThrough：403 瞬时类要换出口/换凭据重试到预算用尽，
+// 失败后仍把**上游原始 403 + body** 透传（不得改写成 502）。
+func TestTransient403RetriesThenPassesThrough(t *testing.T) {
+	quotaCase(t)
+	hits, restore := fakeUpstream(t, writeTransient403)
+	defer restore()
+
+	body, status, _, err := callOpenCodeAPI(context.Background(),
+		map[string]any{"model": "space-bunny-free"}, "space-bunny-free")
+	want := int64(keyPoolDefaultRetries + 1) // 与凭据级 429 同一重试预算
+	if got := hits.Load(); got != want {
+		t.Fatalf("403 瞬时错误应重试到预算用尽（%d 次上游），实际 %d 次", want, got)
+	}
+	if err == nil || status != http.StatusForbidden {
+		t.Fatalf("试满后应回上游原始 403 + error，得到 status=%d err=%v", status, err)
+	}
+	if !strings.Contains(string(body), "Endpoint is unavailable") {
+		t.Fatalf("应透传上游原始错误体，得到 %s", body)
+	}
+}
+
+// TestTransient403RetriesStream：判据在流式入口同样生效（两处是各自独立的循环）。
+func TestTransient403RetriesStream(t *testing.T) {
+	quotaCase(t)
+	hits, restore := fakeUpstream(t, writeTransient403)
+	defer restore()
+
+	rc, status, _, _ := callOpenCodeAPIStream(context.Background(),
+		map[string]any{"model": "space-bunny-free"}, "space-bunny-free")
+	defer rc.Close()
+	if got := hits.Load(); got != int64(keyPoolDefaultRetries+1) {
+		t.Fatalf("流式入口的 403 瞬时错误也应重试到预算用尽，实际 %d 次上游", got)
+	}
+	if status != http.StatusForbidden {
+		t.Fatalf("流式入口应透传上游原始 403，得到 %d", status)
+	}
+	b, _ := io.ReadAll(rc)
+	if !strings.Contains(string(b), "Endpoint is unavailable") {
+		t.Fatalf("流式入口应透传上游原始错误体，得到 %s", b)
+	}
+}
+
+// TestForbiddenNonTransientNotRetried：403 里只认 `Endpoint is unavailable`。
+// FreeTierError（会话门）与 `Model is unavailable`（模型已下线）都是重试无意义的硬失败。
+func TestForbiddenNonTransientNotRetried(t *testing.T) {
+	quotaCase(t)
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"403 FreeTierError（会话门）", http.StatusForbidden, `{"error":{"type":"FreeTierError","message":"free tier"}}`},
+		{"400 Model is unavailable（模型已下线）", http.StatusBadRequest, modelGoneBody},
+	}
+	for _, c := range cases {
+		hits, restore := fakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(c.status)
+			w.Write([]byte(c.body))
+		})
+		_, status, _, err := callOpenCodeAPI(context.Background(),
+			map[string]any{"model": "space-bunny-free"}, "space-bunny-free")
+		restore()
+		if got := hits.Load(); got != 1 {
+			t.Errorf("%s：不该重试，实际打了 %d 次上游", c.name, got)
+		}
+		if err == nil || status != c.status {
+			t.Errorf("%s：应透传上游 %d，得到 status=%d err=%v", c.name, c.status, status, err)
+		}
 	}
 }

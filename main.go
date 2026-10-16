@@ -1439,6 +1439,23 @@ func isQuotaClass429(h http.Header, body []byte) bool {
 	return false
 }
 
+// isRetryableQuotaUpstream 是「换出口 + 换凭据后值得再试」的窄判据：
+// 429，以及**以 403 形态回来的同一份瞬时上游错误**。
+//
+// 上游把 `Endpoint is unavailable`（server_error）有时回 429、有时回 403，
+// body 逐字相同（CMP-46 实测）。429 形态本来就进重试；403 形态原先直接落透传分支，
+// 既不换出口也不换凭据且零日志 —— 出口抽到持续报错的节点时会**永久卡死**。
+//
+// 判据必须只认 message `Endpoint is unavailable`，绝不能认整个 `type:"server_error"`：
+// 同一个 type 下还有 `Model is unavailable`（模型已下线，实质永久错误，实测回 400），
+// 拖进重试只会白烧凭据与出口、把首字节延迟拉到分钟级。400 本轮不纳入。
+func isRetryableQuotaUpstream(status int, body []byte) bool {
+	if status == http.StatusTooManyRequests {
+		return true
+	}
+	return status == http.StatusForbidden && bytes.Contains(body, []byte("Endpoint is unavailable"))
+}
+
 // quotaBreakerBlocked 熔断期内返回缓存的 Retry-After 与 true。
 // 熔断期满即删除条目，让下一发真实探一次上游。
 func quotaBreakerBlocked(model string) (string, bool) {
@@ -2991,20 +3008,26 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode == http.StatusTooManyRequests {
-			// key_id 打进这行是刻意的：运营要能只凭日志确认轮转真的在工作
-			// （老容器对应的是 msg=upstream_attempt ... key_id=k82）。
+		// 429 与「403 + Endpoint is unavailable」是同一类瞬时上游错误的两种状态码形态（CMP-46），
+		// 两种都要换出口/换凭据再试。配额语义只有 429 有：403 形态不是额度耗尽，永远换 key。
+		if isRetryableQuotaUpstream(resp.StatusCode, errBody) {
 			retryAfter := resp.Header.Get("Retry-After")
-			quota := isQuotaClass429(resp.Header, errBody)
+			quota := resp.StatusCode == http.StatusTooManyRequests && isQuotaClass429(resp.Header, errBody)
 			nextKey := ""
 			if !quota {
 				nextKey = advanceOCKey(ocCurrentSessionID())
 			}
-			log.Printf("%s[upstream rate limited] model=%s key_id=%s exit=%s status=%d retry_after=%q quota=%t next_key_id=%s body=%s", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode, retryAfter, quota, nextKey, string(errBody))
+			if resp.StatusCode == http.StatusTooManyRequests {
+				// key_id 打进这行是刻意的：运营要能只凭日志确认轮转真的在工作
+				// （老容器对应的是 msg=upstream_attempt ... key_id=k82）。
+				log.Printf("%s[upstream rate limited] model=%s key_id=%s exit=%s status=%d retry_after=%q quota=%t next_key_id=%s body=%s", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode, retryAfter, quota, nextKey, string(errBody))
+			} else {
+				log.Printf("%s[upstream retryable] model=%s key_id=%s exit=%s status=%d next_key_id=%s body=%s", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode, nextKey, string(errBody))
+			}
 			lastBody = errBody
 			lastStatus = resp.StatusCode
 			lastHeader = resp.Header.Clone()
-			lastErr = fmt.Errorf("upstream rate limited")
+			lastErr = fmt.Errorf("upstream retryable error")
 			if quota {
 				noteQuotaExhausted(modelID, retryAfter)
 				log.Printf("%s[quota exhausted] model=%s attempt=%d retry_after=%q 不换 key/出口，透传上游 429", labelPrefix(ctx), modelID, attempt, retryAfter)
@@ -3016,9 +3039,10 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 			}
 		}
 		logFreeTierRejection(ctx, modelID, resp.StatusCode, errBody)
-		if debugMode {
-			log.Printf("%s[upstream error] model=%s status=%d body=%s", labelPrefix(ctx), modelID, resp.StatusCode, string(errBody))
-		}
+		// 没进任何重试分支的上游非 2xx 一律无条件记一行：此前只有 -debug 才可见，
+		// 而生产默认不开 -debug ⇒ 这些错误（400 `Model is unavailable`、各类 5xx、
+		// 上游换措辞后的新 4xx）在日志里完全不可观测。
+		log.Printf("%s[upstream error] model=%s status=%d body=%s", labelPrefix(ctx), modelID, resp.StatusCode, string(errBody))
 		// 5xx（500/502/503/504…）不再重试：直接走下面的透传分支，把上游状态码与错误体原样交给客户端，
 		// 由客户端自己决定要不要重发。（这里原先做的是无限指数退避重试，会把请求永久挂住。）
 		lastBody = errBody
@@ -3086,14 +3110,19 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode == http.StatusTooManyRequests {
+		// 与 callOpenCodeAPI 同源：429 与「403 + Endpoint is unavailable」都换出口/换凭据再试。
+		if isRetryableQuotaUpstream(resp.StatusCode, errBody) {
 			retryAfter := resp.Header.Get("Retry-After")
-			quota := isQuotaClass429(resp.Header, errBody)
+			quota := resp.StatusCode == http.StatusTooManyRequests && isQuotaClass429(resp.Header, errBody)
 			nextKey := ""
 			if !quota {
 				nextKey = advanceOCKey(ocCurrentSessionID())
 			}
-			log.Printf("%s[upstream rate limited] model=%s key_id=%s exit=%s status=%d retry_after=%q quota=%t next_key_id=%s body=%s", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode, retryAfter, quota, nextKey, string(errBody))
+			if resp.StatusCode == http.StatusTooManyRequests {
+				log.Printf("%s[upstream rate limited] model=%s key_id=%s exit=%s status=%d retry_after=%q quota=%t next_key_id=%s body=%s", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode, retryAfter, quota, nextKey, string(errBody))
+			} else {
+				log.Printf("%s[upstream retryable] model=%s key_id=%s exit=%s status=%d next_key_id=%s body=%s", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode, nextKey, string(errBody))
+			}
 			if quota {
 				noteQuotaExhausted(modelID, retryAfter)
 				log.Printf("%s[quota exhausted] model=%s attempt=%d retry_after=%q 不换 key/出口，透传上游 429", labelPrefix(ctx), modelID, attempt, retryAfter)
@@ -3105,9 +3134,8 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 			}
 		}
 		logFreeTierRejection(ctx, modelID, resp.StatusCode, errBody)
-		if debugMode {
-			log.Printf("%s[upstream error] model=%s status=%d body=%s", labelPrefix(ctx), modelID, resp.StatusCode, string(errBody))
-		}
+		// 同 callOpenCodeAPI：未进重试分支的上游非 2xx 无条件记一行，不再受 -debug 约束。
+		log.Printf("%s[upstream error] model=%s status=%d body=%s", labelPrefix(ctx), modelID, resp.StatusCode, string(errBody))
 		// 5xx（500/502/503/504…）不再重试：直接走下面的透传分支，把上游状态码与错误体原样交给客户端，
 		// 由客户端自己决定要不要重发。（这里原先做的是无限指数退避重试，会把请求永久挂住。）
 		// 返回错误体供下游透传
