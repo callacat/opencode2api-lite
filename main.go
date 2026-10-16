@@ -517,11 +517,16 @@ var (
 //  6. body 必须 stream:true；非流式客户端由代理聚合成非流式返回，感知不变。
 //
 // 10-13 时代的要求/容忍项已失效：x-session-id 头、「会话是否真实注册过」。
-const (
+// 两个上游基址是 var 而非 const：测试要把重试循环指到本地假上游，
+// 才能把「配额类 429 打几次上游」这类行为钉住（见 main_test.go）。
+var (
 	// 免费层（keyless，Bearer public）车道上游
 	ocInferenceBase = "https://opencode.ai/inference"
 	// keyed（oc_sk_*）车道上游
 	ocZenBase = "https://opencode.ai/zen"
+)
+
+const (
 	// 官方 CLI 2.x 三段式 UA，逐字符是门禁的一部分
 	ocClientUA = "opencode/latest/2.0.29/cli"
 )
@@ -1367,6 +1372,136 @@ func advanceOCKey(session string) string {
 	nxt := (ocKeys.sticky[session]%n + 1) % n
 	ocKeys.sticky[session] = nxt
 	return ocKeys.keys[nxt].id
+}
+
+// ======================== 配额类 429 熔断 ========================
+//
+// 上游对「免费层模型日配额耗尽」一律回 429 + body.type=FreeUsageLimitError，
+// 且 Retry-After 精确指向次日 00:00 UTC（CMP-48 实测 94/94，跨 12.2h 离散 ≤4s）。
+//
+// 反向证据（所以轮转不能整个删掉）：命中过 429 的 31 发里 27 发最终 200 —— 轮转在
+// 「池里还有活凭据」时是有救的。因此这里只对**配额类**收手，凭据级/瞬时限流照旧
+// 换 key 换出口多试；配额类则单发只打一次上游，不再连试（判据 1 + 判据 3），
+// 同模型连撞到阈值即整段熔断，后续请求连上游都不打（判据 2）。
+//
+// 代价（已知，取舍留痕）：27/31 的救回靠的正是第 2–5 次轮转，配额类单发只打一次
+// 之后这部分救回会丢，换来的是首字节延迟从 8–22s 回到 ~1s（CMP-48 §3）。
+// 要换回救回率，把下面 429 分支里的 `if quota` 短路段改成带重试预算的版本即可。
+//
+// 熔断保持时间按 Retry-After 截断到上限：Retry-After 的**声明**值不可信
+// （CMP-26 实测真实恢复早于声明边界最多 8 小时，且是渐进排空），
+// 照它睡 9 小时会把一个已经能用的模型挡在外面。
+const (
+	// 同模型连续撞到这么多次配额 429 ⇒ 熔断
+	quotaBreakerThreshold = 3
+	// 「连续」的计数窗口，超窗即重新计数
+	quotaBreakerWindow = 10 * time.Minute
+	// 熔断保持时长上限 / 下限
+	quotaBreakerMaxHold = 15 * time.Minute
+	quotaBreakerMinHold = 30 * time.Second
+)
+
+type quotaBreakerEntry struct {
+	consecutive int
+	firstAt     time.Time
+	openUntil   time.Time
+	retryAfter  string
+}
+
+var (
+	quotaBreakerMu sync.Mutex
+	quotaBreakers  = map[string]*quotaBreakerEntry{}
+)
+
+// parseRetryAfterSeconds 解析 Retry-After 的整数秒形态。上游实测都是整数秒，
+// HTTP-date 形态不认（认了也只会落到别的分支，不影响配额判定）。
+func parseRetryAfterSeconds(v string) (int, bool) {
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// isQuotaClass429 判定「免费层模型日配额耗尽」类 429。
+// 主判据是 body 指纹 FreeUsageLimitError；Retry-After > 60s 只作兜底，
+// 好让上游换措辞时仍能识别（瞬时类 `Endpoint is unavailable` 的 Retry-After 是空串，不会误命中）。
+func isQuotaClass429(h http.Header, body []byte) bool {
+	if bytes.Contains(body, []byte("FreeUsageLimitError")) {
+		return true
+	}
+	if n, ok := parseRetryAfterSeconds(h.Get("Retry-After")); ok && n > 60 {
+		return true
+	}
+	return false
+}
+
+// quotaBreakerBlocked 熔断期内返回缓存的 Retry-After 与 true。
+// 熔断期满即删除条目，让下一发真实探一次上游。
+func quotaBreakerBlocked(model string) (string, bool) {
+	quotaBreakerMu.Lock()
+	defer quotaBreakerMu.Unlock()
+	e := quotaBreakers[model]
+	if e == nil || e.openUntil.IsZero() {
+		return "", false
+	}
+	if time.Now().After(e.openUntil) {
+		delete(quotaBreakers, model)
+		return "", false
+	}
+	return e.retryAfter, true
+}
+
+// noteQuotaExhausted 记一次配额 429；同模型在窗口内连撞到阈值即打开熔断。
+func noteQuotaExhausted(model, retryAfter string) {
+	now := time.Now()
+	quotaBreakerMu.Lock()
+	defer quotaBreakerMu.Unlock()
+	e := quotaBreakers[model]
+	if e == nil || now.Sub(e.firstAt) > quotaBreakerWindow {
+		e = &quotaBreakerEntry{firstAt: now}
+		quotaBreakers[model] = e
+	}
+	e.consecutive++
+	e.retryAfter = retryAfter
+	if e.consecutive < quotaBreakerThreshold {
+		return
+	}
+	hold := quotaBreakerMaxHold
+	if n, ok := parseRetryAfterSeconds(retryAfter); ok {
+		if d := time.Duration(n) * time.Second; d < hold {
+			hold = d
+		}
+	}
+	if hold < quotaBreakerMinHold {
+		hold = quotaBreakerMinHold
+	}
+	e.openUntil = now.Add(hold)
+}
+
+// noteUpstreamOK 该模型拿到 2xx：清零计数并解除熔断。
+func noteUpstreamOK(model string) {
+	quotaBreakerMu.Lock()
+	delete(quotaBreakers, model)
+	quotaBreakerMu.Unlock()
+}
+
+// quotaExhaustedBody 熔断快速失败时回给客户端的 body。形状与上游 FreeUsageLimitError
+// 一致，免得客户端按两套错误结构分支。
+func quotaExhaustedBody() []byte {
+	return []byte(`{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded. Please try again later."}}`)
+}
+
+// quotaExhaustedHeaders 熔断快速失败时的响应头，带上最后一次观测到的 Retry-After。
+func quotaExhaustedHeaders(retryAfter string) http.Header {
+	h := http.Header{}
+	if retryAfter != "" {
+		h.Set("Retry-After", retryAfter)
+	}
+	return h
 }
 
 // ======================== Claude Messages API 类型 ========================
@@ -2806,6 +2941,12 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 	if extra := keyPoolExtraAttempts(); extra > 0 && attempts < extra+1 {
 		attempts = extra + 1
 	}
+	// 该模型额度已被打光时连上游都不打：轮转与换出口对配额类 429 无效，
+	// 每发白烧凭据与出口，首字节延迟从 ~1s 拉到 8–22s（CMP-48 §3 判据 3 实测）。
+	if ra, blocked := quotaBreakerBlocked(modelID); blocked {
+		log.Printf("%s[quota breaker open] model=%s retry_after=%q 跳过上游直接回 429", labelPrefix(ctx), modelID, ra)
+		return quotaExhaustedBody(), http.StatusTooManyRequests, quotaExhaustedHeaders(ra), fmt.Errorf("upstream quota exhausted")
+	}
 	// 这个循环只服务两类重试：429 换出口/换凭据重试、Tor 电路故障 / 网络层错误重试。
 	// 5xx 已不再重试 —— 直接走下面的透传分支，把上游状态码与错误体原样交给客户端。
 	for attempt := 0; ; {
@@ -2845,6 +2986,7 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 			if debugMode && keyID != "" {
 				log.Printf("%s[upstream ok] model=%s key_id=%s exit=%s status=%d", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode)
 			}
+			noteUpstreamOK(modelID)
 			return b, resp.StatusCode, resp.Header, nil
 		}
 		errBody, _ := io.ReadAll(resp.Body)
@@ -2852,12 +2994,22 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 		if resp.StatusCode == http.StatusTooManyRequests {
 			// key_id 打进这行是刻意的：运营要能只凭日志确认轮转真的在工作
 			// （老容器对应的是 msg=upstream_attempt ... key_id=k82）。
-			nextKey := advanceOCKey(ocCurrentSessionID())
-			log.Printf("%s[upstream rate limited] model=%s key_id=%s exit=%s status=%d retry_after=%q next_key_id=%s body=%s", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode, resp.Header.Get("Retry-After"), nextKey, string(errBody))
+			retryAfter := resp.Header.Get("Retry-After")
+			quota := isQuotaClass429(resp.Header, errBody)
+			nextKey := ""
+			if !quota {
+				nextKey = advanceOCKey(ocCurrentSessionID())
+			}
+			log.Printf("%s[upstream rate limited] model=%s key_id=%s exit=%s status=%d retry_after=%q quota=%t next_key_id=%s body=%s", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode, retryAfter, quota, nextKey, string(errBody))
 			lastBody = errBody
 			lastStatus = resp.StatusCode
 			lastHeader = resp.Header.Clone()
 			lastErr = fmt.Errorf("upstream rate limited")
+			if quota {
+				noteQuotaExhausted(modelID, retryAfter)
+				log.Printf("%s[quota exhausted] model=%s attempt=%d retry_after=%q 不换 key/出口，透传上游 429", labelPrefix(ctx), modelID, attempt, retryAfter)
+				return lastBody, lastStatus, lastHeader, lastErr
+			}
 			rotateSocks5OnRateLimit(ctx)
 			if attempt < attempts {
 				continue
@@ -2899,6 +3051,11 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 	if extra := keyPoolExtraAttempts(); extra > 0 && attempts < extra+1 {
 		attempts = extra + 1
 	}
+	// 同 callOpenCodeAPI：该模型额度打光后连上游都不打。
+	if ra, blocked := quotaBreakerBlocked(modelID); blocked {
+		log.Printf("%s[quota breaker open] model=%s retry_after=%q 跳过上游直接回 429", labelPrefix(ctx), modelID, ra)
+		return io.NopCloser(bytes.NewReader(quotaExhaustedBody())), http.StatusTooManyRequests, quotaExhaustedHeaders(ra), nil
+	}
 	// 这个循环只服务两类重试：429 换出口/换凭据重试、Tor 电路故障 / 网络层错误重试。
 	// 5xx 已不再重试 —— 直接走下面的透传分支，把上游状态码与错误体原样交给客户端。
 	for attempt := 0; ; {
@@ -2924,13 +3081,24 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 			if debugMode && keyID != "" {
 				log.Printf("%s[upstream ok] model=%s key_id=%s exit=%s status=%d", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode)
 			}
+			noteUpstreamOK(modelID)
 			return resp.Body, resp.StatusCode, resp.Header, nil
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusTooManyRequests {
-			nextKey := advanceOCKey(ocCurrentSessionID())
-			log.Printf("%s[upstream rate limited] model=%s key_id=%s exit=%s status=%d retry_after=%q next_key_id=%s body=%s", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode, resp.Header.Get("Retry-After"), nextKey, string(errBody))
+			retryAfter := resp.Header.Get("Retry-After")
+			quota := isQuotaClass429(resp.Header, errBody)
+			nextKey := ""
+			if !quota {
+				nextKey = advanceOCKey(ocCurrentSessionID())
+			}
+			log.Printf("%s[upstream rate limited] model=%s key_id=%s exit=%s status=%d retry_after=%q quota=%t next_key_id=%s body=%s", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode, retryAfter, quota, nextKey, string(errBody))
+			if quota {
+				noteQuotaExhausted(modelID, retryAfter)
+				log.Printf("%s[quota exhausted] model=%s attempt=%d retry_after=%q 不换 key/出口，透传上游 429", labelPrefix(ctx), modelID, attempt, retryAfter)
+				return io.NopCloser(bytes.NewReader(errBody)), resp.StatusCode, resp.Header.Clone(), nil
+			}
 			rotateSocks5OnRateLimit(ctx)
 			if attempt < attempts {
 				continue

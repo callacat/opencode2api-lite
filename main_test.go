@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -660,4 +661,139 @@ func TestKeyPoolExtraAttemptsBound(t *testing.T) {
 		t.Errorf("凭据多于 max_retries 时应取 max_retries=%d，得到 %d", keyPoolDefaultRetries, got)
 	}
 	applyConfig(AppConfig{})
+}
+
+// ======================== 配额类 429（CMP-83） ========================
+//
+// 上游对「免费层模型日配额耗尽」回 429 + body.type=FreeUsageLimitError，Retry-After
+// 精确指向次日 00:00 UTC（CMP-48 实测 94/94）。卡面判据 1/3：这类 429 不能换 key
+// 换出口连试 5 次 —— 实测 5 凭据 × 2 出口 100% 仍 429，只把首字节延迟从 ~1s 拉到
+// 8–22s。下面三个用例分别钉住：配额类只打 1 次上游、凭据级仍然轮转（反向证据，
+// 命中 429 的 31 发里 27 发靠轮转救回，不能被这次改动误删）、同模型连撞即熔断。
+
+const quotaTestBody = `{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded. Please try again later."}}`
+
+// fakeUpstream 把两条上游基址指到本地假上游并数命中次数。
+// ocInferenceBase/ocZenBase 是包级 var 而非 const，就是为了这条缝（test-only 改动）。
+func fakeUpstream(t *testing.T, handler http.HandlerFunc) (*atomic.Int64, func()) {
+	t.Helper()
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		handler(w, r)
+	}))
+	oldInference, oldZen := ocInferenceBase, ocZenBase
+	ocInferenceBase, ocZenBase = srv.URL, srv.URL
+	return &hits, func() {
+		ocInferenceBase, ocZenBase = oldInference, oldZen
+		srv.Close()
+	}
+}
+
+// quotaCase 备好「池里有 6 条凭据 ⇒ 凭据级 429 本可换 4 次、共打 5 次上游」的前提。
+func quotaCase(t *testing.T) {
+	t.Helper()
+	// 挡掉 initOCSession 里对 registry.npmjs.org 的版本探测：用例不该依赖外网。
+	ocOnce.Do(func() {})
+	quotaBreakerMu.Lock()
+	quotaBreakers = map[string]*quotaBreakerEntry{}
+	quotaBreakerMu.Unlock()
+	applyConfig(AppConfig{OCSessionID: testSession, KeyPool: testPool("sticky",
+		"oc_sk_a", "oc_sk_b", "oc_sk_c", "oc_sk_d", "oc_sk_e", "oc_sk_f")})
+	t.Cleanup(func() { applyConfig(AppConfig{}) })
+	if got := keyPoolExtraAttempts(); got == 0 {
+		t.Fatalf("用例前提不成立：期望池内容许多试，得到 %d", got)
+	}
+}
+
+func writeQuota429(w http.ResponseWriter, retryAfter string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Retry-After", retryAfter)
+	w.WriteHeader(http.StatusTooManyRequests)
+	w.Write([]byte(quotaTestBody))
+}
+
+// TestQuotaClass429StopsAtOneUpstreamCall 判据 1/3：配额类 429 单发只打一次上游，
+// 不换 key 换出口，并把上游 429 + Retry-After 原样透传。
+func TestQuotaClass429StopsAtOneUpstreamCall(t *testing.T) {
+	quotaCase(t)
+	hits, restore := fakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		writeQuota429(w, "33553") // 到次日 00:00 UTC 的剩余秒数（CMP-48 实测形态）
+	})
+	defer restore()
+
+	body, status, hdr, err := callOpenCodeAPI(context.Background(),
+		map[string]any{"model": "space-bunny-free", "stream": true}, "space-bunny-free")
+	if err == nil {
+		t.Fatal("配额类 429 应以失败返回，得到 nil error")
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("配额类 429 只该打 1 次上游，实际 %d 次（判据 1/3 回归）", got)
+	}
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("应透传上游 429，得到 %d", status)
+	}
+	if got := hdr.Get("Retry-After"); got != "33553" {
+		t.Fatalf("Retry-After 应原样透传，得到 %q", got)
+	}
+	if !strings.Contains(string(body), "FreeUsageLimitError") {
+		t.Fatalf("应透传上游错误体，得到 %s", body)
+	}
+}
+
+// TestCredential429StillRotates 是判据 1 的反向对照：没有 FreeUsageLimitError 指纹、
+// Retry-After 只有 1s 的 429 属凭据级/瞬时类，必须继续换凭据重试到预算用尽。
+func TestCredential429StillRotates(t *testing.T) {
+	quotaCase(t)
+	hits, restore := fakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":{"message":"slow down"}}`))
+	})
+	defer restore()
+
+	if _, status, _, _ := callOpenCodeAPI(context.Background(),
+		map[string]any{"model": "space-bunny-free"}, "space-bunny-free"); status != http.StatusTooManyRequests {
+		t.Fatalf("凭据级 429 试满后仍应回 429，得到 %d", status)
+	}
+	want := int64(keyPoolDefaultRetries + 1) // 首试 + max_retries 次换凭据
+	if got := hits.Load(); got != want {
+		t.Fatalf("凭据级 429 应轮转重试到预算用尽（%d 次上游），实际 %d 次", want, got)
+	}
+}
+
+// TestQuotaBreakerFastFailsAfterThreshold 判据 2：同模型连撞到阈值后，
+// 后续请求连上游都不打，直接回 429 + 缓存的 Retry-After。
+func TestQuotaBreakerFastFailsAfterThreshold(t *testing.T) {
+	quotaCase(t)
+	hits, restore := fakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		writeQuota429(w, "33553")
+	})
+	defer restore()
+
+	for i := 1; i <= quotaBreakerThreshold; i++ {
+		if _, status, _, _ := callOpenCodeAPI(context.Background(),
+			map[string]any{"model": "space-bunny-free"}, "space-bunny-free"); status != http.StatusTooManyRequests {
+			t.Fatalf("第 %d 发撞配额 429，应回 429，得到 %d", i, status)
+		}
+	}
+	if got := hits.Load(); got != int64(quotaBreakerThreshold) {
+		t.Fatalf("熔断前每发应各打 1 次上游，实际 %d 次", got)
+	}
+
+	before := hits.Load()
+	body, status, hdr, err := callOpenCodeAPI(context.Background(),
+		map[string]any{"model": "space-bunny-free"}, "space-bunny-free")
+	if got := hits.Load(); got != before {
+		t.Fatalf("熔断打开后不该再打上游，多打了 %d 次", got-before)
+	}
+	if err == nil || status != http.StatusTooManyRequests {
+		t.Fatalf("熔断快失败应回 429 + error，得到 status=%d err=%v", status, err)
+	}
+	if got := hdr.Get("Retry-After"); got != "33553" {
+		t.Fatalf("熔断快失败应带最后一次观测到的 Retry-After，得到 %q", got)
+	}
+	if !strings.Contains(string(body), "FreeUsageLimitError") {
+		t.Fatalf("熔断快失败的 body 应与上游同形，得到 %s", body)
+	}
 }
