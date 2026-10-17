@@ -47,10 +47,8 @@ docker run -d --name opencode2api-lite \
   -p 8000:8000 \
   -v "$PWD/data:/data" \
   ghcr.io/callacat/opencode2api-lite:latest \
-  -listen 0.0.0.0 -password your-password
+  -password your-password
 ```
-
-`-listen 0.0.0.0` 不能省：二进制默认只绑 `127.0.0.1`，不写这一项宿主端口映射打不进来。
 
 Compose 见 [`docker-compose.example.yml`](docker-compose.example.yml)；镜像支持 `linux/amd64` 与 `linux/arm64`。
 
@@ -121,17 +119,17 @@ curl -s http://127.0.0.1:8000/v1/messages \
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `-port` | `8000` | 监听端口 |
-| `-listen` | `127.0.0.1` | 监听地址。默认只绑回环；写 `0.0.0.0` 才对外，且**必须同时设 `-password`**，否则拒绝启动 |
+| `-listen` | 空 | 监听地址。**留空 = 绑全网卡**（与历史行为一致，容器靠 `ports:` 映射进来就靠它）；写 `127.0.0.1` 只绑回环；写非回环地址**必须同时设 `-password`**，否则拒绝启动 |
 | `-config` | `config.json` | 配置文件路径 |
-| `-password` | 空 | 管理面板密码；留空则不启用登录验证（只允许绑回环时留空） |
+| `-password` | 空 | 管理面板密码；留空则不启用登录验证 |
 | `-debug` | `false` | 调试日志 |
 
 监听地址也可用环境变量 `OC_LISTEN_ADDR` 或配置里的 `listen_addr` 指定，优先级
-`-listen > OC_LISTEN_ADDR > config.listen_addr > 127.0.0.1`。
+`-listen > OC_LISTEN_ADDR > config.listen_addr`；三者都空则沿用历史行为（`":"+port`）。
 
-> ⚠️ 容器部署注意：默认只绑回环，`ports:` 映射进来会连不上。官方 `Dockerfile` 已带
-> `CMD ["-listen", "0.0.0.0"]`；**如果你自己的 `docker-compose.yml` 覆盖了 `command:`，
-> 必须把 `-listen 0.0.0.0` 补上**。
+> Android app 走的是另一条路：它**显式传** `-listen 127.0.0.1`（局域网开关打开才传 `0.0.0.0`
+> 并强制面板密码），所以手机上默认只对本机可见，而服务器部署的默认行为一字未变。
+> 本地 app 的安全默认由调用方承担，不改库的默认值——已有部署（含现网容器）升级后不受影响。
 
 ## Android
 

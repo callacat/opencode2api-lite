@@ -19,18 +19,16 @@
   - 产物：`oc2api-android-<version>.apk`（arm64-v8a + x86_64），CI 内 `apksigner verify`
     + `sha256sum`，tag 推送时附到对应 Release。
 
-### 变更（不兼容）
+### 变更
 
-- **监听地址默认值从「全网卡」改为 `127.0.0.1`**。原 `main.go` 是 `addr := ":"+port`，
-  等于把代理**和管理面板一起**暴露到所有网卡；面板能改上游会话与凭据池，
-  裸暴露等于把凭据送出去。现在：
-  - 新增 `-listen` 参数 / `OC_LISTEN_ADDR` 环境变量 / `listen_addr` 配置字段，
-    优先级 `-listen > OC_LISTEN_ADDR > config.listen_addr > 127.0.0.1`；
-  - 绑定非回环地址时**必须**同时给 `-password`，否则进程直接拒绝启动（`validateListenAddr`）；
-  - ⚠️ **升级影响**：容器部署原来靠 `ports: 8000:8000` 映射进来，不显式绑 `0.0.0.0`
-    会连不上。`Dockerfile` 已加 `CMD ["-listen", "0.0.0.0"]`，
-    `docker-compose.example.yml` 的 `command` 也已补上 —— **自有 `docker-compose.yml` 里
-    覆盖了 `command:` 的部署（含现网 oraarm）必须先补 `-listen 0.0.0.0` 再升级**。
+- **新增 `-listen` 参数 / `OC_LISTEN_ADDR` 环境变量 / `listen_addr` 配置字段**，用来显式指定
+  监听地址，优先级 `-listen > OC_LISTEN_ADDR > config.listen_addr`。
+  - **默认行为不变**：三者都留空时仍是 `addr := ":"+port`（绑全网卡），已有部署升级后监听行为
+    一字不变 —— 改库的默认值会波及所有消费者（现网容器就不传 `-listen`），故默认值刻意不动。
+  - 显式写了非回环地址却没有 `-password` 时**拒绝启动**（`validateListenAddr`）：面板能改上游会话
+    与凭据池，裸暴露等于把凭据送人。只对显式传参的调用方生效，老部署不受影响。
+  - Android app 靠这条参数把自己的默认收紧成 `127.0.0.1`（局域网开关打开才传 `0.0.0.0`
+    并强制面板密码）——本地 app 的安全默认由调用方承担。
 
 ### 修复
 

@@ -738,11 +738,6 @@ func fetchModels() ([]ModelInfo, error) {
 
 // ======================== 配置 ========================
 
-// defaultListenAddr 是监听地址的安全默认值：只绑回环。
-// 老版本 `addr := ":"+port` 会把代理和管理面板一起暴露到全网卡，而面板能改上游会话
-// 与凭据池，裸暴露等于把凭据送人；要对外服务必须显式写 0.0.0.0（容器见 Dockerfile 的 CMD）。
-const defaultListenAddr = "127.0.0.1"
-
 var (
 	port       string
 	listenAddr string
@@ -1168,7 +1163,8 @@ type AppConfig struct {
 	// 未启用或池为空时鉴权回落到 Bearer public，行为与本字段引入前完全一致。
 	KeyPool *KeyPoolConfig `json:"key_pool,omitempty"`
 
-	// ListenAddr 是监听主机（不含端口）。留空 = 只绑 127.0.0.1（安全默认）。
+	// ListenAddr 是监听主机（不含端口）。留空 = 沿用历史行为（`":"+port`，绑全网卡），
+	// 已有部署升级后监听行为一字不变；要只绑回环就显式写 127.0.0.1。
 	// 命令行 -listen 与环境变量 OC_LISTEN_ADDR 优先于本字段。
 	ListenAddr string `json:"listen_addr,omitempty"`
 }
@@ -1680,14 +1676,25 @@ func normalizeConfig(cfg *AppConfig) {
 	normalizeKeyPool(cfg.KeyPool)
 }
 
-// resolveListenAddr 决定监听主机：命令行 > 环境变量 > 配置文件 > 默认 127.0.0.1。
+// resolveListenAddr 决定监听主机：命令行 > 环境变量 > 配置文件。
+// 三者都空时返回空串，表示沿用历史行为（`":"+port`，绑全网卡）。这里刻意不给默认值：
+// 改默认值会波及所有消费者（现网容器就不传 -listen），要只绑回环由调用方显式传。
 func resolveListenAddr(flagVal, envVal, cfgVal string) string {
 	for _, v := range []string{flagVal, envVal, cfgVal} {
 		if s := strings.TrimSpace(v); s != "" {
 			return s
 		}
 	}
-	return defaultListenAddr
+	return ""
+}
+
+// listenAddrString 把主机+端口拼成 http.Server 用的地址。
+// host 为空 = 沿用历史行为，绑全网卡（即 ":"+port）——这是老部署不传 -listen 时的路径。
+func listenAddrString(host, port string) string {
+	if strings.TrimSpace(host) == "" {
+		return ":" + port
+	}
+	return net.JoinHostPort(host, port)
 }
 
 // isLoopbackHost 判断绑定主机是否只对本机可见。
@@ -1702,8 +1709,8 @@ func isLoopbackHost(host string) bool {
 	return false
 }
 
-// validateListenAddr 拦住「绑非回环地址却没有面板密码」的组合：面板能改上游会话与
-// 凭据池，裸暴露等于把凭据送人。局域网共享必须显式设密码才算显式选择。
+// validateListenAddr 拦住「显式绑非回环地址却没有面板密码」的组合：面板能改上游会话与
+// 凭据池，裸暴露等于把凭据送人。只在调用方显式给地址时才校验，不传 -listen 的历史行为不受影响。
 func validateListenAddr(host, password string) error {
 	if isLoopbackHost(host) || strings.TrimSpace(password) != "" {
 		return nil
@@ -6272,7 +6279,7 @@ var version = "dev"
 
 func main() {
 	flag.StringVar(&port, "port", "8000", "服务端口")
-	flag.StringVar(&listenAddr, "listen", "", "监听地址（默认 127.0.0.1；0.0.0.0 绑全网卡，必须同时设 -password）")
+	flag.StringVar(&listenAddr, "listen", "", "监听地址（留空 = 绑全网卡，与历史行为一致；写 127.0.0.1 只绑回环。写非回环地址必须同时设 -password）")
 	flag.StringVar(&configPath, "config", "config.json", "配置文件路径")
 	flag.StringVar(&adminPassword, "password", "", "管理面板密码（留空则不启用登录验证）")
 	flag.BoolVar(&debugMode, "debug", false, "启用调试日志")
@@ -6283,11 +6290,14 @@ func main() {
 	if env := strings.TrimSpace(os.Getenv("OC_SESSION_ID")); env != "" {
 		cfg.OCSessionID = env
 	}
-	// 监听地址同样三级回落：-listen > OC_LISTEN_ADDR > config.listen_addr > 127.0.0.1。
+	// 监听地址三级回落：-listen > OC_LISTEN_ADDR > config.listen_addr。都空 = 沿用历史行为。
 	listenAddr = resolveListenAddr(listenAddr, os.Getenv("OC_LISTEN_ADDR"), cfg.ListenAddr)
-	if err := validateListenAddr(listenAddr, adminPassword); err != nil {
-		log.Fatalf("启动失败: %v", err)
+	if listenAddr != "" {
+		if err := validateListenAddr(listenAddr, adminPassword); err != nil {
+			log.Fatalf("启动失败: %v", err)
+		}
 	}
+	addr := listenAddrString(listenAddr, port)
 	applyConfig(cfg)
 	if err := saveConfig(configPath, cfg); err != nil {
 		log.Printf("警告: 无法保存配置: %v", err)
@@ -6303,7 +6313,7 @@ func main() {
 	log.Printf("===================")
 	log.Printf("版本:     %s", version)
 	log.Printf("端口:     %s", port)
-	log.Printf("监听:     %s", listenAddr)
+	log.Printf("监听:     %s", addr)
 	log.Printf("上游:     %s/v1/chat/completions (API，免费层)", ocInferenceBase)
 	log.Printf("模型：  异步加载中")
 	log.Printf("别名：  %d", len(modelAlias))
@@ -6335,7 +6345,6 @@ func main() {
 		}
 		http.NotFound(w, r)
 	})
-	addr := net.JoinHostPort(listenAddr, port)
 	log.Printf("服务器启动在 %s", addr)
 	go initializeOpenCode()
 	go statsFlusher()

@@ -15,6 +15,5 @@ services:
     volumes:
       - ./data:/data
     # 管理面板密码：留空 = 无认证；对外必须设置
-    # -listen 0.0.0.0 必须带：二进制默认只绑 127.0.0.1，不写这一项宿主端口映射打不进来
-    command: ["-listen", "0.0.0.0", "-password", "change-me"]
+    command: ["-password", "change-me"]
     # 更多参数：-port 8000 / -config config.json / -debug

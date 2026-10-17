@@ -1037,14 +1037,12 @@ func TestFreeTier403PassesThroughWhenBudgetExhausted(t *testing.T) {
 // 该策略由代码（`if !freeTier403 { rotateSocks5OnRateLimit }`）与金丝雀日志的 `exit=`
 // 字段（403 那一发与重试那一发必须相同）共同覆盖。
 
-// TestResolveListenAddr 钉住监听地址的三级回落顺序。默认值必须是回环地址：
-// 老版本 `addr := ":"+port` 会把面板连凭据池一起暴露到全网卡，回退错一级就是安全事故。
+// TestResolveListenAddr 钉住监听地址的三级回落顺序。
+// 三者都空时必须返回空串 = 沿用历史行为（绑全网卡）：改库的默认值会波及所有消费者
+// （现网容器就不传 -listen），所以这里断言「默认路径没被改」而不是「默认更安全」。
 func TestResolveListenAddr(t *testing.T) {
-	if got := resolveListenAddr("", "", ""); got != defaultListenAddr {
-		t.Errorf("全空应回落到 %s，得到 %s", defaultListenAddr, got)
-	}
-	if defaultListenAddr != "127.0.0.1" {
-		t.Fatalf("安全默认值被改成 %s，本用例的前提失效", defaultListenAddr)
+	if got := resolveListenAddr("", "", ""); got != "" {
+		t.Errorf("全空必须返回空串（沿用 `\":\"+port`），得到 %q", got)
 	}
 	cases := []struct {
 		name           string
@@ -1054,12 +1052,32 @@ func TestResolveListenAddr(t *testing.T) {
 		{"命令行最高优先", "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.1"},
 		{"无命令行时环境变量优先", "", "10.0.0.2", "10.0.0.3", "10.0.0.2"},
 		{"只有配置就用配置", "", "", "10.0.0.3", "10.0.0.3"},
-		{"空白视为未设置", "  ", "\t", " ", defaultListenAddr},
+		{"空白视为未设置", "  ", "\t", " ", ""},
 		{"两端空白裁掉", " 0.0.0.0 ", "", "", "0.0.0.0"},
 	}
 	for _, c := range cases {
 		if got := resolveListenAddr(c.flag, c.env, c.cfg); got != c.want {
 			t.Errorf("%s：resolveListenAddr(%q,%q,%q) = %q, want %q", c.name, c.flag, c.env, c.cfg, got, c.want)
+		}
+	}
+}
+
+// TestListenAddrString 钉住「不传 -listen 时 addr 仍是 `:port`」——老部署升级后
+// 监听行为必须一字不变（现网容器不传 -listen，这里回退错就是断网事故）。
+func TestListenAddrString(t *testing.T) {
+	cases := []struct {
+		host, port, want string
+	}{
+		{"", "8000", ":8000"},   // 历史行为
+		{"  ", "8000", ":8000"}, // 空白等同未设置
+		{"127.0.0.1", "8000", "127.0.0.1:8000"},
+		{"0.0.0.0", "8000", "0.0.0.0:8000"},
+		{"::1", "8000", "[::1]:8000"}, // IPv6 必须带方括号
+		{"::", "8000", "[::]:8000"},
+	}
+	for _, c := range cases {
+		if got := listenAddrString(c.host, c.port); got != c.want {
+			t.Errorf("listenAddrString(%q,%q) = %q, want %q", c.host, c.port, got, c.want)
 		}
 	}
 }
