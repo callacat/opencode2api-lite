@@ -297,12 +297,12 @@ public class MainActivity extends AppCompatActivity {
         int colorAttr = running ? com.google.android.material.R.attr.colorPrimary
                 : error ? com.google.android.material.R.attr.colorError
                 : com.google.android.material.R.attr.colorOnSurface;
-        status.setTextColor(MaterialColors.getColor(this, colorAttr));
+        status.setTextColor(MaterialColors.getColor(status, colorAttr));
 
         String err = currentError();
         if (error && !err.isEmpty()) {
             statusDetail.setText(err);
-            statusDetail.setTextColor(MaterialColors.getColor(this,
+            statusDetail.setTextColor(MaterialColors.getColor(statusDetail,
                     com.google.android.material.R.attr.colorError));
             statusDetail.setVisibility(View.VISIBLE);
         } else {
