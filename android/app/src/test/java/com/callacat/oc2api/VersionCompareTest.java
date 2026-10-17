@@ -75,10 +75,21 @@ public class VersionCompareTest {
         assertFalse(VersionCompare.isNewer("dev", "dev"));
     }
 
+    /** 远端拿不到版本号（Release 没 tag_name 之类）时不提示更新 —— 没有可比的对象。 */
     @Test
-    public void emptyInputsNeverReportAnUpdate() {
+    public void missingRemoteVersionNeverReportsAnUpdate() {
         assertFalse(VersionCompare.isNewer("", "1.0.4"));
-        assertFalse(VersionCompare.isNewer("v1.0.5", ""));
+        assertFalse(VersionCompare.isNewer(null, "1.0.4"));
         assertFalse(VersionCompare.isNewer(null, null));
+    }
+
+    /**
+     * 本机版本读不到时按最旧处理（与 dev 同一条规则：不是版本号就当 0.0.0）。
+     * 真机上 versionName 一定有值，这条只是锁住规则本身，别把方向写反。
+     */
+    @Test
+    public void missingLocalVersionIsTreatedAsOldest() {
+        assertTrue(VersionCompare.isNewer("v1.0.5", ""));
+        assertTrue(VersionCompare.isNewer("v1.0.5", null));
     }
 }
