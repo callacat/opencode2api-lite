@@ -243,6 +243,20 @@ public class MainActivity extends Activity {
         busy = false;
         checkButton.setEnabled(true);
         int code = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+        if (code == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+            // 系统把「确认安装」这一步交回调用方：必须把它给的 Intent 起起来，
+            // 否则用户看不到任何界面、会话也不会往下走。
+            // （真机首测就卡在这里：EXTRA_STATUS = -1，被我当初当成失败处理了。）
+            Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT);
+            setUpdateText("等待系统安装确认…");
+            if (confirm != null) {
+                confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(confirm);
+            } else {
+                setUpdateText("安装未完成：系统未返回确认界面");
+            }
+            return;
+        }
         if (code == PackageInstaller.STATUS_SUCCESS) {
             setUpdateText("安装完成，重启后生效");
             toast("更新完成");
