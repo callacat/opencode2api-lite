@@ -62,8 +62,10 @@ public class MainActivity extends Activity {
         lanSwitch.setChecked(ProxyService.isLanMode(p));
         debugBox.setChecked(p.getBoolean(ProxyService.KEY_DEBUG, false));
 
-        findViewById(R.id.start).setOnClickListener(v -> onStart());
-        findViewById(R.id.stop).setOnClickListener(v -> onStop());
+        // 方法名不能叫 onStart/onStop：会与 Activity 的生命周期回调撞名，编译期直接报
+        // "cannot override onStart() in Activity"（首跑 39012779007 就是这么挂的）。
+        findViewById(R.id.start).setOnClickListener(v -> startProxy());
+        findViewById(R.id.stop).setOnClickListener(v -> stopProxy());
         Button battery = findViewById(R.id.battery);
         battery.setOnClickListener(v -> requestIgnoreBatteryOptimizations());
 
@@ -74,7 +76,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void onStart() {
+    private void startProxy() {
         int port;
         try {
             port = Integer.parseInt(portInput.getText().toString().trim());
@@ -113,7 +115,7 @@ public class MainActivity extends Activity {
         webView.postDelayed(() -> webView.loadUrl(url), PANEL_WAIT_MS);
     }
 
-    private void onStop() {
+    private void stopProxy() {
         stopService(new Intent(this, ProxyService.class));
         status.setText(R.string.idle);
         webView.loadUrl("about:blank");
