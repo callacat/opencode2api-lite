@@ -6003,6 +6003,8 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:14
 body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%;background:radial-gradient(ellipse at 30% 20%,var(--glow-a) 0%,transparent 50%),radial-gradient(ellipse at 70% 80%,var(--glow-b) 0%,transparent 50%);pointer-events:none;z-index:0}
 .container{max-width:1020px;margin:0 auto;padding:32px 24px;position:relative;z-index:1}
 header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid var(--border);justify-content:space-between}
+.head-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.head-btn{font-size:13px;padding:7px 11px;white-space:nowrap}
 .logo{display:flex;align-items:center;gap:10px}
 .logo-mark{width:36px;height:36px;background:linear-gradient(135deg,var(--accent),#8b6cff);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;color:#fff;flex-shrink:0}
 .logo-text{font-size:22px;font-weight:700;letter-spacing:-.5px;background:linear-gradient(135deg,var(--text),var(--text-sec));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
@@ -6012,12 +6014,13 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 .card h2{font-size:13px;font-weight:600;margin-bottom:16px;letter-spacing:.2px;display:flex;align-items:center;gap:8px;color:var(--text-sec);text-transform:uppercase}
 .card h2 .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 .config-grid{display:grid;grid-template-columns:2fr 3fr;gap:16px;margin-top:16px}
+.config-grid>*{min-width:0}
 .config-grid .card{margin-bottom:0}
 .full-row{grid-column:1/-1}
 .form-group{margin-bottom:14px}
 .form-group:last-child{margin-bottom:0}
 .form-group label{display:block;font-size:11.5px;font-weight:500;color:var(--text-ter);margin-bottom:5px;letter-spacing:.4px;text-transform:uppercase}
-.form-group input[type="text"],.form-group input[type="url"],.form-group input[type="password"],.form-group textarea,.form-group select,.m-select{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--mono);background:var(--surface-2);color:var(--text);transition:border-color .15s,box-shadow .15s}
+.form-group input[type="text"],.form-group input[type="url"],.form-group input[type="password"],.form-group textarea,.form-group select,.m-select,.m-input{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--mono);background:var(--surface-2);color:var(--text);transition:border-color .15s,box-shadow .15s}
 .form-group input:focus,.form-group textarea:focus,.form-group select:focus,.m-select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}
 .form-group .hint{font-size:11px;color:var(--text-ter);margin-top:4px;line-height:1.4}
 .actions{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
@@ -6032,6 +6035,8 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 .btn-warning:hover{background:var(--orange);color:#fff}
 .btn-danger{background:var(--red-dim);color:var(--red)}
 .btn-danger:hover{background:var(--red);color:#fff}
+.tbl-wrap{margin-bottom:12px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+#statsContent{overflow-x:auto;-webkit-overflow-scrolling:touch}
 .tbl{width:100%;border-collapse:collapse;font-size:12.5px}
 .tbl th{text-align:left;font-weight:500;color:var(--text-ter);padding:8px 10px;border-bottom:1px solid var(--border);font-size:11px;letter-spacing:.4px;text-transform:uppercase;white-space:nowrap}
 .tbl td{padding:7px 10px;border-bottom:1px solid var(--border)}
@@ -6061,7 +6066,6 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 #toast.error{background:rgba(240,96,96,.85)}
 #toast.show{opacity:1;transform:translateY(0)}
 .empty-hint{color:var(--text-ter);font-size:13px;padding:28px;text-align:center}
-@media(max-width:700px){.config-grid{grid-template-columns:1fr}.container{padding:16px 12px}header{flex-direction:column;align-items:flex-start;gap:8px}.effort-label-row,.effort-row{grid-template-columns:minmax(90px,1fr) 22px minmax(90px,1fr) auto}}
 .theme-toggle{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 12px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;transition:all .15s;color:var(--text-sec);flex-shrink:0;line-height:1}
 .theme-toggle:hover{border-color:var(--border-light);color:var(--text)}
 .panel-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:16px}
@@ -6093,6 +6097,14 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 .ver-chip .up{color:var(--orange);font-weight:600}
 .ver-chip .ok{color:var(--green);font-weight:500}
 .ver-chip .fail{color:var(--text-ter)}
+/* —— 手机视口适配（放最后：同特异度下靠后的规则才压得住上面那些基础规则）——
+   竖屏走 ≤700px（实测 OPPO PKG110 = 361px CSS 宽）；横屏宽 794px 过了宽度断点、
+   但可视高度只剩 ~397px，故并入 max-height:520px 一档，否则横屏退回桌面字号与触控尺寸 */
+@media(max-width:700px),(max-height:520px) and (orientation:landscape){.config-grid{grid-template-columns:1fr}.container{padding:16px 12px}header{flex-direction:column;align-items:flex-start;gap:8px}.head-actions{width:100%}.ver-chip{flex:0 0 100%;white-space:normal;flex-wrap:wrap}.effort-label-row,.effort-row{grid-template-columns:minmax(90px,1fr) 22px minmax(90px,1fr) auto}.stats-header .btns,.panel-header .btns{flex-wrap:wrap}#toast{left:12px;right:12px;top:12px}}
+/* 字号下限 14px；输入框 16px（低于 16 时 iOS/部分安卓浏览器聚焦会自动放大页面）；可点控件 ≥44px */
+@media(max-width:700px),(max-height:520px) and (orientation:landscape){.tbl th,.tbl td,.form-group label,.form-group .hint,.effort-label-row,.advanced-settings summary,.advanced-hint,.advanced-summary-count,.empty-hint,.ver-chip{font-size:14px}.form-group input,.form-group textarea,.form-group select,.m-select,.m-input,.tbl input,.tbl .m-select,.effort-row input{font-size:16px;min-height:44px}.btn,.tbl .btn,.effort-row .btn,.theme-toggle,.head-btn,.advanced-settings summary{min-height:44px}.btn,.tbl .btn,.effort-row .btn,.head-btn{font-size:14px;padding:10px 14px}.tbl input,.tbl select,.tbl .m-select{min-width:120px}#statsTable td:first-child,#dailyTable td:first-child{min-width:110px}}
+/* 横屏专属：压扁页头。竖屏那条两行页头留在 ~397px 高的屏上会吃掉小半屏 */
+@media(max-height:520px) and (orientation:landscape){header{flex-direction:row;align-items:center;gap:8px;margin-bottom:14px;padding-bottom:10px}.head-actions{width:auto;flex-wrap:nowrap;gap:6px;justify-content:flex-end}.ver-chip{flex:0 1 auto;min-width:0;max-width:230px}.logo-text{font-size:15px;white-space:nowrap}.logo-sub{display:none}.container{padding:12px 16px}#toast{top:8px;right:8px}}
 </style>
 </head>
 <body>
@@ -6105,11 +6117,11 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 <div class="logo-sub">OpenCode 免费 API → 兼容格式代理</div>
 </div>
 </div>
-<div style="display:flex;align-items:center;gap:8px">
+<div class="head-actions">
 <span class="ver-chip"><b id="verCur" title="当前版本">…</b><span id="verStatus"></span></span>
-<button class="theme-toggle" id="verCheckBtn" onclick="checkUpdate()" title="检查更新" style="font-size:12px;padding:6px 10px">检查更新</button>
+<button class="theme-toggle head-btn" id="verCheckBtn" onclick="checkUpdate()" title="检查更新">检查更新</button>
 <button class="theme-toggle" onclick="toggleTheme()" title="切换主题">☀</button>
-<form method="post" action="/logout" style="margin:0"><button class="theme-toggle" type="submit" title="退出登录" style="font-size:14px">退出</button></form>
+<form method="post" action="/logout" style="margin:0"><button class="theme-toggle head-btn" type="submit" title="退出登录">退出</button></form>
 </div>
 </header>
 
@@ -6136,7 +6148,7 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 <button class="btn btn-success" onclick="saveConfig()">保存全部</button>
 </div>
 </div>
-<div style="margin-bottom:12px">
+<div class="tbl-wrap">
 <table class="tbl" id="aliasTable">
 <thead><tr><th style="width:22%">别名（请求名）</th><th style="width:28%">实际模型（无图）</th><th style="width:28%">多模态模型（带图）</th><th style="width:22%"></th></tr></thead>
 <tbody></tbody>
@@ -6155,7 +6167,7 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 
 <div class="card full-row">
 <h2><span class="dot" style="background:var(--accent)"></span>SOCKS5 代理</h2>
-<div style="margin-bottom:12px">
+<div class="tbl-wrap">
 <table class="tbl" id="socks5Table">
 <thead><tr><th style="width:25%">名称</th><th style="width:28%">地址</th><th style="width:17%">用户名</th><th style="width:17%">密码</th><th style="width:13%"></th></tr></thead>
 <tbody></tbody>
@@ -6211,7 +6223,7 @@ async function saveConfig(){collectAliases();collectEfforts();collectSocks5();co
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
 async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await fetch('/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}
-async function loadStats(){try{const r=await fetch('/api/stats');const d=await r.json();const ms=d.models||{};const ks=Object.keys(ms);const dm=d.daily?d.daily.models||{}:{};const dk=Object.keys(dm);let h='';if(d.daily&&d.daily.date){h+='<div style="margin-bottom:16px;padding:10px 14px;background:var(--accent);color:#fff;border-radius:8px;font-size:13px">📊 今日统计 ('+esc(d.daily.date)+')：请求 '+fmt(d.daily.total_requests)+' 次</div>'}if(dk.length>0){h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">今日模型用量</h3><table class="tbl" id="dailyTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';let dr=0,dp=0,dc=0,dt=0;for(const k of dk){const m=dm[k];if(!m)continue;h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';dr+=m.request_count;dp+=m.prompt_tokens;dc+=m.completion_tokens;dt+=m.total_tokens}h+='<tr style="font-weight:600"><td>今日合计</td><td>'+fmt(dr)+'</td><td>'+fmt(dp)+'</td><td>'+fmt(dc)+'</td><td>'+fmt(dt)+'</td></tr>';h+='</tbody></table><hr style="border:none;border-top:1px solid var(--border);margin:20px 0">'}h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">累计统计</h3><table class="tbl" id="statsTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';if(!ks.length){h+='<tr><td colspan="5" class="empty-hint">暂无数据</td></tr>'}else{let tr=0,pt=0,ct=0,tt=0;for(const k of ks){const m=ms[k];h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';tr+=m.request_count;pt+=m.prompt_tokens;ct+=m.completion_tokens;tt+=m.total_tokens}h+='<tr style="font-weight:600"><td>累计总计</td><td>'+fmt(tr)+'</td><td>'+fmt(pt)+'</td><td>'+fmt(ct)+'</td><td>'+fmt(tt)+'</td></tr>'}h+='</tbody></table>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}
+async function loadStats(){try{const r=await fetch('/api/stats');const d=await r.json();const ms=d.models||{};const ks=Object.keys(ms);const dm=d.daily?d.daily.models||{}:{};const dk=Object.keys(dm);let h='';if(d.daily&&d.daily.date){h+='<div style="margin-bottom:16px;padding:10px 14px;background:var(--accent);color:#fff;border-radius:8px;font-size:14px">📊 今日统计 ('+esc(d.daily.date)+')：请求 '+fmt(d.daily.total_requests)+' 次</div>'}if(dk.length>0){h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">今日模型用量</h3><table class="tbl" id="dailyTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';let dr=0,dp=0,dc=0,dt=0;for(const k of dk){const m=dm[k];if(!m)continue;h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';dr+=m.request_count;dp+=m.prompt_tokens;dc+=m.completion_tokens;dt+=m.total_tokens}h+='<tr style="font-weight:600"><td>今日合计</td><td>'+fmt(dr)+'</td><td>'+fmt(dp)+'</td><td>'+fmt(dc)+'</td><td>'+fmt(dt)+'</td></tr>';h+='</tbody></table><hr style="border:none;border-top:1px solid var(--border);margin:20px 0">'}h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">累计统计</h3><table class="tbl" id="statsTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';if(!ks.length){h+='<tr><td colspan="5" class="empty-hint">暂无数据</td></tr>'}else{let tr=0,pt=0,ct=0,tt=0;for(const k of ks){const m=ms[k];h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';tr+=m.request_count;pt+=m.prompt_tokens;ct+=m.completion_tokens;tt+=m.total_tokens}h+='<tr style="font-weight:600"><td>累计总计</td><td>'+fmt(tr)+'</td><td>'+fmt(pt)+'</td><td>'+fmt(ct)+'</td><td>'+fmt(tt)+'</td></tr>'}h+='</tbody></table>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}
 let verBusy=false;
 function renderVersion(d){const cur=document.getElementById('verCur'),st=document.getElementById('verStatus');const v=d.version||'dev';cur.textContent=v;cur.title=v==='dev'?'本地构建，未注入版本号':'当前版本 '+v;st.textContent='';st.className='';if(d.error){st.textContent='检查失败';st.className='fail';return}if(d.has_update){st.className='up';st.textContent='有新版本 '+d.latest+' ';const a=document.createElement('a');a.href=d.release_url||'https://github.com/callacat/opencode2api-lite/releases/latest';a.target='_blank';a.rel='noopener';a.textContent='查看';st.appendChild(a);return}if(v==='dev'){st.textContent='未注入版本';st.className='fail';return}st.textContent='已是最新';st.className='ok'}
 async function checkUpdate(silent){if(verBusy)return;verBusy=true;const b=document.getElementById('verCheckBtn'),label=b.textContent;b.disabled=true;b.textContent='检查中…';try{const r=await fetch('/api/version');const d=await r.json();renderVersion(d);if(silent)return;if(d.error)showToast('检查更新失败','error');else if(d.has_update)showToast('发现新版本 '+d.latest,'error');else showToast('已是最新','success')}catch(e){const st=document.getElementById('verStatus');st.textContent='检查失败';st.className='fail';if(!silent)showToast('检查更新失败','error')}finally{b.disabled=false;b.textContent=label;verBusy=false}}
