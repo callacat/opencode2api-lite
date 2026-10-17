@@ -68,3 +68,8 @@ android {
         }
     }
 }
+
+dependencies {
+    // 只用于 JVM 单测（版本比对 / 缓存 TTL / sha256 校验），不进 APK。
+    testImplementation 'junit:junit:4.13.2'
+}
