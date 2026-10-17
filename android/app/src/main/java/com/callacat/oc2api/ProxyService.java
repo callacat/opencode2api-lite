@@ -248,8 +248,12 @@ public class ProxyService extends Service {
             while ((n = in.read(buf)) > 0) {
                 out.write(buf, 0, n);
             }
+            Log.i(TAG, "已从 assets 落默认配置到 " + cfg);
+        } catch (IOException e) {
+            // 种子配置缺失不是致命错：Go 侧 loadConfig 对读不到的文件返回归一化默认，
+            // 启动后 saveConfig 会立刻补写。宁可少一份种子，也不能因此起不来进程。
+            Log.w(TAG, "assets 无默认配置，交给代理自建: " + e.getMessage());
         }
-        Log.i(TAG, "已从 assets 落默认配置到 " + cfg);
         return cfg;
     }
 

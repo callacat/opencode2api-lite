@@ -1,6 +1,10 @@
 # 运行时生成（配置 / 用量统计，含端口与出口代理信息，不入库）
 config.json
 stats.json
+# 例外：Android 侧这份是随包发布的"首次启动默认配置"，必须入库。
+# 没有它，getAssets().open("config.json") 抛 FileNotFoundException，代理进程永远起不来
+# （CI 全绿但装到手机上启动失败，2026-10-17 真机实测踩过）。
+!android/app/src/main/assets/config.json
 
 # 构建产物
 opencode2api-lite

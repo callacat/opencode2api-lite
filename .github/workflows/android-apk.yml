@@ -237,6 +237,12 @@ jobs:
           echo "== unzip -l（确认两个 ABI 的 liboc2api.so 都在包内）=="
           unzip -l "dist/${APK_NAME}" | grep -E 'lib/.*/liboc2api\.so' || { echo "APK 内没有 liboc2api.so"; exit 1; }
 
+          # 种子配置必须在包里：缺了它 App 首次启动就 getAssets().open 失败、代理起不来。
+          # （曾被根 .gitignore 的 config.json 规则整份吞掉，CI 全绿、装到手机上却起不来。）
+          echo "== 种子配置清单 =="
+          unzip -l "dist/${APK_NAME}" | grep -E 'assets/config\.json' \
+            || { echo "APK 内没有 assets/config.json（检查是否被 .gitignore 或资源压缩吞掉）"; exit 1; }
+
           echo "== apksigner verify =="
           APKSIGNER="$ANDROID_HOME/build-tools/${BUILD_TOOLS}/apksigner"
           "$APKSIGNER" verify --verbose --print-certs "dist/${APK_NAME}"
