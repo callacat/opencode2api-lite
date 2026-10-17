@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1148,5 +1149,143 @@ func TestListenAddrConfigRoundTrip(t *testing.T) {
 	}
 	if host := resolveListenAddr("", "", got.ListenAddr); host != "0.0.0.0" {
 		t.Errorf("配置里的 listen_addr 应被采纳，得到 %q", host)
+	}
+}
+
+// ======================== 上游黑洞不拖死整机（CMP-119） ========================
+//
+// 现场（真机 PKG110 / Android 15）：进程存活、端口 LISTEN，但 /、/health、
+// /api/config 全部无响应，持续 ≥9 分钟。根因有三条互相独立的「无上界等待」，
+// 每条都由下面一个用例钉住；/health 与上游解耦由 TestHealthOutlivesBlackholedUpstream
+// 直接判。
+
+// blackholeUpstream 起一个「accept 之后永不回应」的上游，返回它的基址。
+// 这正是现场形态：TCP 连得上，连接一直挂着，但一个字节都不回 ——
+// 比 RST 难缠得多，因为内核不会替你把 socket 收掉。
+func blackholeUpstream(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("监听失败: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		// held 让已 accept 的连接保持可达：net.Conn 有 finalizer 会关 fd，
+		// 不攥住的话一次 GC 就能把「黑洞」变成 RST，用例前提当场失效。
+		// 声明在闭包内、只写不读，没有跨 goroutine 数据竞争。
+		var held []net.Conn
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			held = append(held, c) // 故意既不写也不关：等客户端自己的超时来收尸
+		}
+	}()
+	return "http://" + ln.Addr().String()
+}
+
+// pointUpstreamAt 把两条上游基址指到指定地址并在用例结束后复位。
+func pointUpstreamAt(t *testing.T, base string) {
+	t.Helper()
+	oldInf, oldZen := ocInferenceBase, ocZenBase
+	ocInferenceBase, ocZenBase = base, base
+	t.Cleanup(func() { ocInferenceBase, ocZenBase = oldInf, oldZen })
+}
+
+// TestFetchModelsDoesNotHangForever 钉住根因之一：模型目录拉取过去不带任何
+// context、传输层也没有超时，上游黑洞时永久阻塞。它在启动路径上（go
+// initializeOpenCode），并且经 initOCSession 挂在 sync.Once 上 —— 一旦卡死，
+// 之后每一次业务请求都在 Once 上排队等它，整机停摆且不重启不恢复。
+func TestFetchModelsDoesNotHangForever(t *testing.T) {
+	ocOnce.Do(func() {}) // 挡掉对 registry.npmjs.org 的真实探测，用例不该依赖外网
+	pointUpstreamAt(t, blackholeUpstream(t))
+
+	old := upstreamModelsTimeout
+	upstreamModelsTimeout = 2 * time.Second
+	defer func() { upstreamModelsTimeout = old }()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := fetchModels(); err == nil {
+			t.Error("黑洞上游不该返回成功")
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("fetchModels 在黑洞上游上永久阻塞（旧实现无任何超时，卡在这里）")
+	}
+}
+
+// TestHealthOutlivesBlackholedUpstream 是本卡的主判据：上游黑洞、
+// 且有一个 goroutine 正卡在上游调用上时，/health 必须照样秒回 200。
+// 走真实 TCP 而不是直接调 handler —— 要证明的是「整机还能服务」，不是
+// 「这个 handler 能返回」。
+func TestHealthOutlivesBlackholedUpstream(t *testing.T) {
+	ocOnce.Do(func() {})
+	pointUpstreamAt(t, blackholeUpstream(t))
+
+	old := upstreamModelsTimeout
+	upstreamModelsTimeout = 5 * time.Second
+	defer func() { upstreamModelsTimeout = old }()
+
+	// 生产注册方式：同一个 mux、同一个 healthHandler。
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// 先让一个上游调用真的挂住，复现「有在途请求卡死」的现场。
+	stuck := make(chan struct{})
+	go func() { defer close(stuck); fetchModels() }()
+	select {
+	case <-stuck:
+		t.Fatal("fetchModels 立即返回了，用例前提不成立")
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	for i := 1; i <= 3; i++ {
+		start := time.Now()
+		resp, err := client.Get(srv.URL + "/health")
+		if err != nil {
+			t.Fatalf("上游黑洞时 /health 第 %d 次请求失败: %v", i, err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("上游黑洞时 /health 应仍为 200，得到 %d", resp.StatusCode)
+		}
+		if d := time.Since(start); d > 2*time.Second {
+			t.Errorf("上游黑洞时 /health 第 %d 次用了 %s，探针不该被上游拖慢", i, d)
+		}
+	}
+}
+
+// TestUpstreamDialErrorRetryIsBounded 钉住根因之二：client.Do 出网络层错误时，
+// 重试循环原来是无条件 continue —— 不查 attempts、不退避、不打日志。上游一挂
+// 就变成满 CPU 死循环，且日志里一个字都看不到。必须有限次后放弃并返回。
+func TestUpstreamDialErrorRetryIsBounded(t *testing.T) {
+	ocOnce.Do(func() {})
+	quotaBreakerMu.Lock()
+	quotaBreakers = map[string]*quotaBreakerEntry{}
+	quotaBreakerMu.Unlock()
+	applyConfig(AppConfig{OCSessionID: testSession})
+	t.Cleanup(func() { applyConfig(AppConfig{}) })
+	// 端口 1 必然连不上：每次 client.Do 立刻返回错误，正好压这条分支。
+	pointUpstreamAt(t, "http://127.0.0.1:1")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		callOpenCodeAPI(context.Background(),
+			map[string]any{"model": "cmp119-probe"}, "cmp119-probe")
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("上游 dial 持续失败时应尽快放弃（旧实现是无限热重试，永远不返回）")
 	}
 }
