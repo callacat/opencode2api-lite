@@ -4,6 +4,34 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **Android APK 形态（CMP-111）**：同仓新增 `android/` Gradle 子工程与
+  `.github/workflows/android-apk.yml`，把代理以静态二进制形式打进 APK，手机上本地跑，
+  WebView 直接复用自带管理面板，无需服务器。
+  - 代理源码**一行业务逻辑未动**；Android 侧只做「拉起进程 + 看守重启 + 显示面板」。
+  - 打包路径：`CGO_ENABLED=1 GOOS=android GOARCH=arm64|amd64` NDK 交叉编译 →
+    `jniLibs/<abi>/liboc2api.so`（lib 前缀 + .so 后缀，系统安装时才会解压到
+    `nativeLibraryDir`，那是 Android 10+ W^X 下少数允许 exec 的目录）。
+  - 前台服务用 `specialUse` 而非 `dataSync`：后者在 Android 15+ 受 6h/24h 总时长上限，
+    到点会被系统杀掉。
+  - 子进程看守：`START_STICKY` + 退出后 1s/2s/4s/8s/15s/30s 退避重启，活过 30s 清零退避。
+  - 产物：`oc2api-android-<version>.apk`（arm64-v8a + x86_64），CI 内 `apksigner verify`
+    + `sha256sum`，tag 推送时附到对应 Release。
+
+### 变更（不兼容）
+
+- **监听地址默认值从「全网卡」改为 `127.0.0.1`**。原 `main.go` 是 `addr := ":"+port`，
+  等于把代理**和管理面板一起**暴露到所有网卡；面板能改上游会话与凭据池，
+  裸暴露等于把凭据送出去。现在：
+  - 新增 `-listen` 参数 / `OC_LISTEN_ADDR` 环境变量 / `listen_addr` 配置字段，
+    优先级 `-listen > OC_LISTEN_ADDR > config.listen_addr > 127.0.0.1`；
+  - 绑定非回环地址时**必须**同时给 `-password`，否则进程直接拒绝启动（`validateListenAddr`）；
+  - ⚠️ **升级影响**：容器部署原来靠 `ports: 8000:8000` 映射进来，不显式绑 `0.0.0.0`
+    会连不上。`Dockerfile` 已加 `CMD ["-listen", "0.0.0.0"]`，
+    `docker-compose.example.yml` 的 `command` 也已补上 —— **自有 `docker-compose.yml` 里
+    覆盖了 `command:` 的部署（含现网 oraarm）必须先补 `-listen 0.0.0.0` 再升级**。
+
 ### 修复
 
 - **403 `FreeTierError` 不进自愈重试，单把失效凭据能卡死整机**（CMP-110，根因来自 CMP-109 分诊）。

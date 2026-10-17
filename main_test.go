@@ -1036,3 +1036,99 @@ func TestFreeTier403PassesThroughWhenBudgetExhausted(t *testing.T) {
 // 而那种模式下 getHTTPClient 会把请求交给 SOCKS5 dialer，假上游够不着，单测钉不住。
 // 该策略由代码（`if !freeTier403 { rotateSocks5OnRateLimit }`）与金丝雀日志的 `exit=`
 // 字段（403 那一发与重试那一发必须相同）共同覆盖。
+
+// TestResolveListenAddr 钉住监听地址的三级回落顺序。默认值必须是回环地址：
+// 老版本 `addr := ":"+port` 会把面板连凭据池一起暴露到全网卡，回退错一级就是安全事故。
+func TestResolveListenAddr(t *testing.T) {
+	if got := resolveListenAddr("", "", ""); got != defaultListenAddr {
+		t.Errorf("全空应回落到 %s，得到 %s", defaultListenAddr, got)
+	}
+	if defaultListenAddr != "127.0.0.1" {
+		t.Fatalf("安全默认值被改成 %s，本用例的前提失效", defaultListenAddr)
+	}
+	cases := []struct {
+		name           string
+		flag, env, cfg string
+		want           string
+	}{
+		{"命令行最高优先", "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.1"},
+		{"无命令行时环境变量优先", "", "10.0.0.2", "10.0.0.3", "10.0.0.2"},
+		{"只有配置就用配置", "", "", "10.0.0.3", "10.0.0.3"},
+		{"空白视为未设置", "  ", "\t", " ", defaultListenAddr},
+		{"两端空白裁掉", " 0.0.0.0 ", "", "", "0.0.0.0"},
+	}
+	for _, c := range cases {
+		if got := resolveListenAddr(c.flag, c.env, c.cfg); got != c.want {
+			t.Errorf("%s：resolveListenAddr(%q,%q,%q) = %q, want %q", c.name, c.flag, c.env, c.cfg, got, c.want)
+		}
+	}
+}
+
+// TestValidateListenAddr 钉住「对外共享必须显式设密码」这条门禁。
+func TestValidateListenAddr(t *testing.T) {
+	ok := []struct {
+		name     string
+		host     string
+		password string
+	}{
+		{"回环无密码放行", "127.0.0.1", ""},
+		{"IPv6 回环放行", "::1", ""},
+		{"localhost 放行", "localhost", ""},
+		{"空主机（等价回环默认）放行", "", ""},
+		{"全网卡带密码放行", "0.0.0.0", "pw"},
+		{"指定网卡带密码放行", "192.168.1.10", "pw"},
+		{"回环带密码放行", "127.0.0.1", "pw"},
+	}
+	for _, c := range ok {
+		if err := validateListenAddr(c.host, c.password); err != nil {
+			t.Errorf("%s：应放行，却报 %v", c.name, err)
+		}
+	}
+	bad := []struct {
+		name     string
+		host     string
+		password string
+	}{
+		{"全网卡无密码拒绝", "0.0.0.0", ""},
+		{"指定网卡无密码拒绝", "192.168.1.10", ""},
+		{"密码只有空白不算设了", "0.0.0.0", "   "},
+		{"IPv6 全网卡无密码拒绝", "::", ""},
+	}
+	for _, c := range bad {
+		if err := validateListenAddr(c.host, c.password); err == nil {
+			t.Errorf("%s：host=%q 无密码必须拒绝启动", c.name, c.host)
+		}
+	}
+}
+
+// TestListenAddrConfigRoundTrip 确认 listen_addr 走 JSON 落盘能原样读回，
+// 且留空时不写进配置（omitempty），老部署升级后配置不会被塞进无意义字段。
+func TestListenAddrConfigRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+
+	empty := AppConfig{}
+	normalizeConfig(&empty)
+	if err := saveConfig(path, empty); err != nil {
+		t.Fatalf("保存空配置失败: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取配置失败: %v", err)
+	}
+	if strings.Contains(string(raw), "listen_addr") {
+		t.Errorf("listen_addr 留空不该落盘，实际配置: %s", raw)
+	}
+
+	set := AppConfig{ListenAddr: " 0.0.0.0 ", ModelAlias: map[string]ModelAlias{}}
+	normalizeConfig(&set)
+	if err := saveConfig(path, set); err != nil {
+		t.Fatalf("保存配置失败: %v", err)
+	}
+	got := loadConfig(path)
+	if got.ListenAddr != "0.0.0.0" {
+		t.Errorf("listen_addr 应原样读回 0.0.0.0，得到 %q", got.ListenAddr)
+	}
+	if host := resolveListenAddr("", "", got.ListenAddr); host != "0.0.0.0" {
+		t.Errorf("配置里的 listen_addr 应被采纳，得到 %q", host)
+	}
+}

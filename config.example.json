@@ -1,4 +1,5 @@
 {
+  "listen_addr": "0.0.0.0",
   "model_alias": {
     "big-pickle": {
       "target_model": "big-pickle"

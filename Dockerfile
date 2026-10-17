@@ -19,3 +19,6 @@ EXPOSE 8000
 HEALTHCHECK --interval=60s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- http://127.0.0.1:8000/health >/dev/null 2>&1 || exit 1
 ENTRYPOINT ["opencode2api-lite"]
+# 二进制默认只绑 127.0.0.1（安全默认，避免裸暴露面板）；容器必须显式绑全网卡，
+# 否则宿主端口映射打不进来。用 command: 覆盖本 CMD 时，务必把 -listen 0.0.0.0 带上。
+CMD ["-listen", "0.0.0.0"]
