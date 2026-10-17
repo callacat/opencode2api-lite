@@ -4,6 +4,45 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **管理面板显示版本号 + 检查更新**（CMP-115）。面板此前**一处版本号都没有** ——
+  构建期注入的 `version`（release tag）只进了启动日志，线上无法从界面确认自己跑的是哪一版，
+  升级只能回终端看 `docker logs`。
+  - 新增 `GET /api/version`（沿用 `requireAuth`）：`{version, latest, has_update, release_url, checked_at}`，
+    远端取 `callacat/opencode2api-lite` 的 `releases/latest` 的 `tag_name`。
+  - 面板页头加版本徽标：当前版本号 + 绿字「已是最新」／橙字「有新版本 vX」+ 可点开的
+    release 链接／灰字「检查失败」；`version == "dev"`（本地 `go build` 未注入）显示
+    「未注入版本」且不参与比较。颜色全部走面板既有主题变量，亮/暗双主题一致。
+  - **比较前两侧都 `TrimPrefix "v"`**：`versionNumbers` 逐段只吃数字字符，
+    `"v1.0.4"` 首段非数字即 break 会被读成 `[0,0,4]`，与 `[1,0,4]` 不等 ⇒
+    漏归一化会把同版本误报成「有更新」、把低版本当成新版。归一化只做在调用点，
+    `versionNumbers` / `compareVersion` 是 UA 版本逻辑共用的，没动。
+  - **GitHub 查询带 30 分钟 TTL 缓存**（`sync.Mutex` 保护，成功与失败同缓存）：
+    `api.github.com` 未认证限 60 次/小时/IP，面板每开一次就打一次会很快打满额度，
+    之后整个面板长期「检查失败」。
+  - **失败静默降级**：5s 超时上下文，网络/限流/仓库不可达一律回 `{"error":"检查失败"}`，
+    不阻塞面板加载、不弹错误糊屏、不影响其它端点；首屏自检静默，仅手动点「检查更新」才弹 toast。
+  - 单测覆盖 `v` 前缀归一化的比较用例与缓存 TTL 行为（TTL 内连查 5 次只出站 1 次；
+    过期重新出站；失败结果同样入缓存）。
+- **管理面板适配手机视口**（CMP-115 追加需求）。面板原有两条 media query 只覆盖了
+  登录页与部分布局，360–430px 视口下宽表把整页撑出横向滚动条、表格里 5 列输入框被压成
+  20px 宽、13px 输入框触发 iOS/安卓浏览器聚焦自动缩放、横屏时页头吃掉小半屏。
+  - 沿用既有 `700px` 断点，**只新增一条高度档位** `max-height:520px and orientation:landscape`：
+    手机横屏视口回到 640–794px 宽、过了宽度断点，但可视高度只剩 ~360–400px，
+    只按宽度断点会把竖屏那条两行页头原样留在横屏。
+  - 宽表（别名/出口/统计）套 `.tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}` 横向滚动；
+    配套 `.config-grid>*{min-width:0}` —— grid item 默认不收缩到 min-content 以下，
+    少了这条卡片会被表格撑到 434px 宽，滚动容器形同虚设、整页仍然横向溢出。
+  - 手机字号下限 14px、输入框 16px（低于 16 时聚焦自动放大页面）、可点控件最小 44px 触控高度；
+    表格内控件 `min-width:120px`、统计表首列 `110px`，避免 5 列输入框塌成一条 20px 宽的缝。
+  - 横屏页头压成单行：隐藏副标题、logo 缩到 15px、版本徽标限宽 230px 内部换行。
+  - 页头右侧操作区与「检查更新/退出」按钮的 inline style 换成 `.head-actions`/`.head-btn` 两个类 ——
+    inline 优先级高于媒体查询，不换掉手机断点改不动这两个按钮。
+  - 桌面端（≥1020px）零变化：新增规则全部在 `max-width`/`max-height` 媒体查询内。
+    唯一基础样式改动是 `.m-input` 补进 `.form-group` 选择器 —— 该类此前没有任何对应规则，
+    「OpenCode 会话 ID」两个输入框一直是浏览器默认样式，现与其余表单项一致。
+
 ### 修复
 
 - **403 `FreeTierError` 不进自愈重试，单把失效凭据能卡死整机**（CMP-110，根因来自 CMP-109 分诊）。
