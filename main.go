@@ -25,16 +25,33 @@ import (
 	"time"
 )
 
-// 直连客户端：不设任何请求超时。Client.Timeout 会覆盖整个请求（含流式读 body），
-// ResponseHeaderTimeout 也会掐断长时间不返回的请求。
-// 请求生命周期完全由调用方 context 控制：客户端断开 / 上游发 [DONE] / 网络层断连。
-var httpClient = &http.Client{
-	Transport: &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-	},
+// newTransport 收口所有上游传输层的超时。CMP-119：这些 Transport 是字面量构造的，
+// 没写的字段全是零值，而零值在 net/http 里等于「无限等」—— 只要上游 accept 了连接
+// 却不再吐响应头，client.Do 就永久阻塞，调用方的 context 又是 Background
+// （fetchOCVersion/fetchModels）或客户端不主动断开的 r.Context()，谁也救不回来。
+// 表现就是「进程存活、端口 LISTEN，但整机 HTTP 无响应」。
+//
+// 三条缺一不可：dial 不设超时（对端黑洞时 SYN 重试两分钟以上才失败）、
+// TLS 握手不设超时、响应头不设超时。三条都只覆盖到「响应头到达」为止，
+// 之后的正文流不受影响，所以 SSE 流式不会被掐断。
+func newTransport(dial func(context.Context, string, string) (net.Conn, error)) *http.Transport {
+	if dial == nil {
+		d := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+		dial = d.DialContext
+	}
+	return &http.Transport{
+		DialContext:           dial,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+	}
 }
+
+// 直连客户端：不设 Client.Timeout（它会覆盖整个请求、连流式读 body 一起掐），
+// 兜底靠 newTransport 里的传输层超时 + 调用方 context。
+var httpClient = &http.Client{Transport: newTransport(nil)}
 
 // ======================== SOCKS5 代理 ========================
 
@@ -205,16 +222,10 @@ func socks5Dial(proxy Socks5Proxy) func(ctx context.Context, network, addr strin
 }
 
 // newSocks5HTTPClient 构建走 SOCKS5 代理的 http.Client。
-// 不设任何请求超时，请求生命周期由调用方 context 控制。
+// 不设 Client.Timeout，请求生命周期由调用方 context 控制；
+// 传输层超时与直连侧同源（见 newTransport）。
 func newSocks5HTTPClient(proxy Socks5Proxy) *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			DialContext:         socks5Dial(proxy),
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 20,
-			IdleConnTimeout:     90 * time.Second,
-		},
-	}
+	return &http.Client{Transport: newTransport(socks5Dial(proxy))}
 }
 
 func closeHTTPClientIdle(client *http.Client) {
@@ -635,8 +646,21 @@ func versionNumbers(v string) [3]int {
 	return out
 }
 
+// 上游控制面调用（版本探测、模型目录）的截止时间。做成 var 而非 const 是为了
+// 测试把黑洞用例的等待压到秒级 —— 与 ocInferenceBase 同一个理由（见其定义处）。
+var (
+	upstreamVersionTimeout = 15 * time.Second
+	upstreamModelsTimeout  = 30 * time.Second
+)
+
 func fetchOCVersion() string {
-	req, _ := http.NewRequest("GET", "https://registry.npmjs.org/opencode-ai/latest", nil)
+	// 这一行是 CMP-119 根因的关键：initOCSession 在 sync.Once 里调本函数，
+	// 旧实现请求没有 context、传输层也没有任何超时，一次黑洞就把 Once 焊死，
+	// 此后每一次 callOpenCodeAPI / callOpenCodeAPIStream / fetchModels
+	// 都在 Once 上永久阻塞 —— 整机停摆且不重启不恢复。
+	ctx, cancel := context.WithTimeout(context.Background(), upstreamVersionTimeout)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", "https://registry.npmjs.org/opencode-ai/latest", nil)
 	req.Header.Set("Accept", "application/json")
 	client, _, err := getHTTPClient(req.Context())
 	if err != nil {
@@ -700,7 +724,11 @@ func fetchModels() ([]ModelInfo, error) {
 	// 模型目录同属免费层：2026-10-14 起随业务流迁到 /inference，并要全套指纹头
 	// （/zen/v1/models 裸头虽仍 200，但那只是遗留只读面，不代表业务车道）。
 	initOCSession() // 保证 ocProjectID 已生成——空 project 头会撞免费层指纹门
-	req, _ := http.NewRequest("GET", ocInferenceBase+"/v1/models", nil)
+	// 同 fetchOCVersion：请求必须带 context，否则黑洞上游下这里永久阻塞，
+	// 启动期的模型拉取会把 /v1/models 一起拖死。
+	ctx, cancel := context.WithTimeout(context.Background(), upstreamModelsTimeout)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", ocInferenceBase+"/v1/models", nil)
 	sid := ocCurrentSessionID()
 	req.Header.Set("Authorization", "Bearer public")
 	req.Header.Set("User-Agent", ocClientUA)
@@ -740,6 +768,7 @@ func fetchModels() ([]ModelInfo, error) {
 
 var (
 	port       string
+	listenAddr string
 	configPath = "config.json"
 	modelAlias = map[string]ModelAlias{}
 
@@ -1161,6 +1190,11 @@ type AppConfig struct {
 	// 单凭据的日预算就是整条链路的日预算；把凭据维度扩回多值才能放大总额度。
 	// 未启用或池为空时鉴权回落到 Bearer public，行为与本字段引入前完全一致。
 	KeyPool *KeyPoolConfig `json:"key_pool,omitempty"`
+
+	// ListenAddr 是监听主机（不含端口）。留空 = 沿用历史行为（`":"+port`，绑全网卡），
+	// 已有部署升级后监听行为一字不变；要只绑回环就显式写 127.0.0.1。
+	// 命令行 -listen 与环境变量 OC_LISTEN_ADDR 优先于本字段。
+	ListenAddr string `json:"listen_addr,omitempty"`
 }
 
 // ======================== key_pool（多凭据轮转） ========================
@@ -1666,7 +1700,50 @@ func normalizeConfig(cfg *AppConfig) {
 	}
 	cfg.OCSessionID = strings.TrimSpace(cfg.OCSessionID)
 	cfg.OCSessionRefreshCmd = strings.TrimSpace(cfg.OCSessionRefreshCmd)
+	cfg.ListenAddr = strings.TrimSpace(cfg.ListenAddr)
 	normalizeKeyPool(cfg.KeyPool)
+}
+
+// resolveListenAddr 决定监听主机：命令行 > 环境变量 > 配置文件。
+// 三者都空时返回空串，表示沿用历史行为（`":"+port`，绑全网卡）。这里刻意不给默认值：
+// 改默认值会波及所有消费者（现网容器就不传 -listen），要只绑回环由调用方显式传。
+func resolveListenAddr(flagVal, envVal, cfgVal string) string {
+	for _, v := range []string{flagVal, envVal, cfgVal} {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// listenAddrString 把主机+端口拼成 http.Server 用的地址。
+// host 为空 = 沿用历史行为，绑全网卡（即 ":"+port）——这是老部署不传 -listen 时的路径。
+func listenAddrString(host, port string) string {
+	if strings.TrimSpace(host) == "" {
+		return ":" + port
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// isLoopbackHost 判断绑定主机是否只对本机可见。
+func isLoopbackHost(host string) bool {
+	h := strings.TrimSpace(host)
+	if h == "" || h == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(strings.Trim(h, "[]")); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// validateListenAddr 拦住「显式绑非回环地址却没有面板密码」的组合：面板能改上游会话与
+// 凭据池，裸暴露等于把凭据送人。只在调用方显式给地址时才校验，不传 -listen 的历史行为不受影响。
+func validateListenAddr(host, password string) error {
+	if isLoopbackHost(host) || strings.TrimSpace(password) != "" {
+		return nil
+	}
+	return fmt.Errorf("监听地址 %q 不是回环地址：对外共享必须同时设置面板密码（-password）", host)
 }
 
 func saveConfig(path string, cfg AppConfig) error {
@@ -3000,7 +3077,14 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 				log.Printf("%s[client gone] model=%s 客户端断开，在途上游请求被取消: %v", labelPrefix(ctx), modelID, ctx.Err())
 				break
 			}
-			continue
+			// CMP-119：网络层错误原来是无条件 continue —— 不查 attempts、不退避、
+			// 不记日志。上游一挂就变成满 CPU 的死循环，且日志里一个字都没有。
+			if attempt < attempts {
+				log.Printf("%s[upstream dial failed] model=%s attempt=%d/%d key_id=%s exit=%s: %v",
+					labelPrefix(ctx), modelID, attempt, attempts, keyID, selection.Label, err)
+				continue
+			}
+			break
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			b, readErr := io.ReadAll(resp.Body)
@@ -3120,7 +3204,13 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 				log.Printf("%s[client gone] model=%s 客户端断开，在途上游请求被取消: %v", labelPrefix(ctx), modelID, ctx.Err())
 				break
 			}
-			continue
+			// 同 callOpenCodeAPI：网络层错误必须有上界，否则是满 CPU 死循环。
+			if attempt < attempts {
+				log.Printf("%s[upstream dial failed] model=%s attempt=%d/%d key_id=%s exit=%s: %v",
+					labelPrefix(ctx), modelID, attempt, attempts, keyID, selection.Label, err)
+				continue
+			}
+			break
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			if debugMode && keyID != "" {
@@ -3325,7 +3415,14 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}()
 		doneSeen := false
+		// CMP-119：客户端断开后写端立即报错，收到就退出循环，别读到上游 EOF
+		// 才罢手（上游流可以一直开着，那样 goroutine 与连接永不释放）。
+		var clientGone bool
 		for {
+			if clientGone {
+				log.Printf("%s client gone mid-stream, stop reading upstream", reqLabel(cnt, r))
+				return
+			}
 			line, err := reader.ReadString('\n')
 			if err != nil {
 				if err == io.EOF {
@@ -3345,7 +3442,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			trimmed := strings.TrimSpace(line)
 			if trimmed == "data: [DONE]" {
 				doneSeen = true
-				w.Write([]byte("data: [DONE]\n\n"))
+				if _, werr := w.Write([]byte("data: [DONE]\n\n")); werr != nil {
+					clientGone = true
+					log.Printf("%s client gone mid-stream: %v", reqLabel(cnt, r), werr)
+					continue
+				}
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
 				}
@@ -3376,7 +3477,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			io.WriteString(w, out+"\n")
+			if _, werr := io.WriteString(w, out+"\n"); werr != nil {
+				clientGone = true
+				log.Printf("%s client gone mid-stream: %v", reqLabel(cnt, r), werr)
+				continue
+			}
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
@@ -4009,13 +4114,24 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 		}
 	}()
 
+	var clientGone bool
 	emitClaudeEvent := func(event string, data any) {
+		if clientGone {
+			return
+		}
 		jsonData, err := json.Marshal(data)
 		if err != nil {
 			log.Printf("Error marshaling Claude SSE event: %v", err)
 			return
 		}
-		io.WriteString(w, "event: "+event+"\ndata: "+string(jsonData)+"\n\n")
+		if _, err := io.WriteString(w, "event: "+event+"\ndata: "+string(jsonData)+"\n\n"); err != nil {
+			// CMP-119：客户端断开后写端立即报错。原来写错误被丢弃，
+			// handler 一直读到上游 EOF 才返回，goroutine 和上游连接一起泄漏；
+			// 面板反复刷新/切页累积起来就是 fd 被吃光、accept 停摆。
+			clientGone = true
+			log.Printf("%s client gone mid-stream: %v", label, err)
+			return
+		}
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -4062,6 +4178,9 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 	}
 
 	for {
+		if clientGone {
+			return
+		}
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
@@ -6228,8 +6347,17 @@ func initializeOpenCode() {
 // 未注入时（本地 go build）为 dev。版本单一来源 = git tag。
 var version = "dev"
 
+// healthHandler 是存活探针：只写 200，不碰上游、不取任何全局锁。
+// 提取成具名函数是为了让回归测试跑到真实代码路径，而不是复制一份 handler
+// ——CMP-119 要求「上游黑洞时 /health 仍须 200」这条判据可自动跑。
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
 func main() {
 	flag.StringVar(&port, "port", "8000", "服务端口")
+	flag.StringVar(&listenAddr, "listen", "", "监听地址（留空 = 绑全网卡，与历史行为一致；写 127.0.0.1 只绑回环。写非回环地址必须同时设 -password）")
 	flag.StringVar(&configPath, "config", "config.json", "配置文件路径")
 	flag.StringVar(&adminPassword, "password", "", "管理面板密码（留空则不启用登录验证）")
 	flag.BoolVar(&debugMode, "debug", false, "启用调试日志")
@@ -6240,6 +6368,14 @@ func main() {
 	if env := strings.TrimSpace(os.Getenv("OC_SESSION_ID")); env != "" {
 		cfg.OCSessionID = env
 	}
+	// 监听地址三级回落：-listen > OC_LISTEN_ADDR > config.listen_addr。都空 = 沿用历史行为。
+	listenAddr = resolveListenAddr(listenAddr, os.Getenv("OC_LISTEN_ADDR"), cfg.ListenAddr)
+	if listenAddr != "" {
+		if err := validateListenAddr(listenAddr, adminPassword); err != nil {
+			log.Fatalf("启动失败: %v", err)
+		}
+	}
+	addr := listenAddrString(listenAddr, port)
 	applyConfig(cfg)
 	if err := saveConfig(configPath, cfg); err != nil {
 		log.Printf("警告: 无法保存配置: %v", err)
@@ -6255,6 +6391,7 @@ func main() {
 	log.Printf("===================")
 	log.Printf("版本:     %s", version)
 	log.Printf("端口:     %s", port)
+	log.Printf("监听:     %s", addr)
 	log.Printf("上游:     %s/v1/chat/completions (API，免费层)", ocInferenceBase)
 	log.Printf("模型：  异步加载中")
 	log.Printf("别名：  %d", len(modelAlias))
@@ -6275,10 +6412,7 @@ func main() {
 	http.HandleFunc("/api/stats", requireAuth(adminStatsHandler))
 	http.HandleFunc("/api/reload", requireAuth(reloadHandler))
 	http.HandleFunc("/api/models", requireAuth(adminModelsHandler))
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
+	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			requireAuth(adminPageHandler)(w, r)
@@ -6286,7 +6420,6 @@ func main() {
 		}
 		http.NotFound(w, r)
 	})
-	addr := ":" + port
 	log.Printf("服务器启动在 %s", addr)
 	go initializeOpenCode()
 	go statsFlusher()

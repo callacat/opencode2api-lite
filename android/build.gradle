@@ -1,0 +1,5 @@
+// AGP 8.5.x 需要 Gradle 8.7+ / JDK 17+；CI 用 gradle/actions/setup-gradle 固定 8.9。
+// 版本号不在此处硬编码，统一由 CI 经 OC2API_VERSION / OC2API_VERSION_CODE 注入。
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+}

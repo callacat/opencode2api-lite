@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1036,3 +1038,319 @@ func TestFreeTier403PassesThroughWhenBudgetExhausted(t *testing.T) {
 // 而那种模式下 getHTTPClient 会把请求交给 SOCKS5 dialer，假上游够不着，单测钉不住。
 // 该策略由代码（`if !freeTier403 { rotateSocks5OnRateLimit }`）与金丝雀日志的 `exit=`
 // 字段（403 那一发与重试那一发必须相同）共同覆盖。
+
+// TestResolveListenAddr 钉住监听地址的三级回落顺序。
+// 三者都空时必须返回空串 = 沿用历史行为（绑全网卡）：改库的默认值会波及所有消费者
+// （现网容器就不传 -listen），所以这里断言「默认路径没被改」而不是「默认更安全」。
+func TestResolveListenAddr(t *testing.T) {
+	if got := resolveListenAddr("", "", ""); got != "" {
+		t.Errorf("全空必须返回空串（沿用 `\":\"+port`），得到 %q", got)
+	}
+	cases := []struct {
+		name           string
+		flag, env, cfg string
+		want           string
+	}{
+		{"命令行最高优先", "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.1"},
+		{"无命令行时环境变量优先", "", "10.0.0.2", "10.0.0.3", "10.0.0.2"},
+		{"只有配置就用配置", "", "", "10.0.0.3", "10.0.0.3"},
+		{"空白视为未设置", "  ", "\t", " ", ""},
+		{"两端空白裁掉", " 0.0.0.0 ", "", "", "0.0.0.0"},
+	}
+	for _, c := range cases {
+		if got := resolveListenAddr(c.flag, c.env, c.cfg); got != c.want {
+			t.Errorf("%s：resolveListenAddr(%q,%q,%q) = %q, want %q", c.name, c.flag, c.env, c.cfg, got, c.want)
+		}
+	}
+}
+
+// TestListenAddrString 钉住「不传 -listen 时 addr 仍是 `:port`」——老部署升级后
+// 监听行为必须一字不变（现网容器不传 -listen，这里回退错就是断网事故）。
+func TestListenAddrString(t *testing.T) {
+	cases := []struct {
+		host, port, want string
+	}{
+		{"", "8000", ":8000"},   // 历史行为
+		{"  ", "8000", ":8000"}, // 空白等同未设置
+		{"127.0.0.1", "8000", "127.0.0.1:8000"},
+		{"0.0.0.0", "8000", "0.0.0.0:8000"},
+		{"::1", "8000", "[::1]:8000"}, // IPv6 必须带方括号
+		{"::", "8000", "[::]:8000"},
+	}
+	for _, c := range cases {
+		if got := listenAddrString(c.host, c.port); got != c.want {
+			t.Errorf("listenAddrString(%q,%q) = %q, want %q", c.host, c.port, got, c.want)
+		}
+	}
+}
+
+// TestValidateListenAddr 钉住「对外共享必须显式设密码」这条门禁。
+func TestValidateListenAddr(t *testing.T) {
+	ok := []struct {
+		name     string
+		host     string
+		password string
+	}{
+		{"回环无密码放行", "127.0.0.1", ""},
+		{"IPv6 回环放行", "::1", ""},
+		{"localhost 放行", "localhost", ""},
+		{"空主机（等价回环默认）放行", "", ""},
+		{"全网卡带密码放行", "0.0.0.0", "pw"},
+		{"指定网卡带密码放行", "192.168.1.10", "pw"},
+		{"回环带密码放行", "127.0.0.1", "pw"},
+	}
+	for _, c := range ok {
+		if err := validateListenAddr(c.host, c.password); err != nil {
+			t.Errorf("%s：应放行，却报 %v", c.name, err)
+		}
+	}
+	bad := []struct {
+		name     string
+		host     string
+		password string
+	}{
+		{"全网卡无密码拒绝", "0.0.0.0", ""},
+		{"指定网卡无密码拒绝", "192.168.1.10", ""},
+		{"密码只有空白不算设了", "0.0.0.0", "   "},
+		{"IPv6 全网卡无密码拒绝", "::", ""},
+	}
+	for _, c := range bad {
+		if err := validateListenAddr(c.host, c.password); err == nil {
+			t.Errorf("%s：host=%q 无密码必须拒绝启动", c.name, c.host)
+		}
+	}
+}
+
+// TestListenAddrConfigRoundTrip 确认 listen_addr 走 JSON 落盘能原样读回，
+// 且留空时不写进配置（omitempty），老部署升级后配置不会被塞进无意义字段。
+func TestListenAddrConfigRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+
+	empty := AppConfig{}
+	normalizeConfig(&empty)
+	if err := saveConfig(path, empty); err != nil {
+		t.Fatalf("保存空配置失败: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取配置失败: %v", err)
+	}
+	if strings.Contains(string(raw), "listen_addr") {
+		t.Errorf("listen_addr 留空不该落盘，实际配置: %s", raw)
+	}
+
+	set := AppConfig{ListenAddr: " 0.0.0.0 ", ModelAlias: map[string]ModelAlias{}}
+	normalizeConfig(&set)
+	if err := saveConfig(path, set); err != nil {
+		t.Fatalf("保存配置失败: %v", err)
+	}
+	got := loadConfig(path)
+	if got.ListenAddr != "0.0.0.0" {
+		t.Errorf("listen_addr 应原样读回 0.0.0.0，得到 %q", got.ListenAddr)
+	}
+	if host := resolveListenAddr("", "", got.ListenAddr); host != "0.0.0.0" {
+		t.Errorf("配置里的 listen_addr 应被采纳，得到 %q", host)
+	}
+}
+
+// ======================== 上游黑洞不拖死整机（CMP-119） ========================
+//
+// 现场（真机 PKG110 / Android 15）：进程存活、端口 LISTEN，但 /、/health、
+// /api/config 全部无响应，持续 ≥9 分钟。根因有三条互相独立的「无上界等待」，
+// 每条都由下面一个用例钉住；/health 与上游解耦由 TestHealthOutlivesBlackholedUpstream
+// 直接判。
+
+// blackholeUpstream 起一个「accept 之后永不回应」的上游，返回它的基址。
+// 这正是现场形态：TCP 连得上，连接一直挂着，但一个字节都不回 ——
+// 比 RST 难缠得多，因为内核不会替你把 socket 收掉。
+func blackholeUpstream(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("监听失败: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		// held 让已 accept 的连接保持可达：net.Conn 有 finalizer 会关 fd，
+		// 不攥住的话一次 GC 就能把「黑洞」变成 RST，用例前提当场失效。
+		// 声明在闭包内、只写不读，没有跨 goroutine 数据竞争。
+		var held []net.Conn
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			held = append(held, c) // 故意既不写也不关：等客户端自己的超时来收尸
+		}
+	}()
+	return "http://" + ln.Addr().String()
+}
+
+// pointUpstreamAt 把两条上游基址指到指定地址并在用例结束后复位。
+func pointUpstreamAt(t *testing.T, base string) {
+	t.Helper()
+	oldInf, oldZen := ocInferenceBase, ocZenBase
+	ocInferenceBase, ocZenBase = base, base
+	t.Cleanup(func() { ocInferenceBase, ocZenBase = oldInf, oldZen })
+}
+
+// TestFetchModelsDoesNotHangForever 钉住根因之一：模型目录拉取过去不带任何
+// context、传输层也没有超时，上游黑洞时永久阻塞。它在启动路径上（go
+// initializeOpenCode），并且经 initOCSession 挂在 sync.Once 上 —— 一旦卡死，
+// 之后每一次业务请求都在 Once 上排队等它，整机停摆且不重启不恢复。
+func TestFetchModelsDoesNotHangForever(t *testing.T) {
+	ocOnce.Do(func() {}) // 挡掉对 registry.npmjs.org 的真实探测，用例不该依赖外网
+	pointUpstreamAt(t, blackholeUpstream(t))
+
+	old := upstreamModelsTimeout
+	upstreamModelsTimeout = 2 * time.Second
+	defer func() { upstreamModelsTimeout = old }()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := fetchModels(); err == nil {
+			t.Error("黑洞上游不该返回成功")
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("fetchModels 在黑洞上游上永久阻塞（旧实现无任何超时，卡在这里）")
+	}
+}
+
+// TestHealthOutlivesBlackholedUpstream 是本卡的主判据：上游黑洞、
+// 且有一个 goroutine 正卡在上游调用上时，/health 必须照样秒回 200。
+// 走真实 TCP 而不是直接调 handler —— 要证明的是「整机还能服务」，不是
+// 「这个 handler 能返回」。
+func TestHealthOutlivesBlackholedUpstream(t *testing.T) {
+	ocOnce.Do(func() {})
+	pointUpstreamAt(t, blackholeUpstream(t))
+
+	old := upstreamModelsTimeout
+	upstreamModelsTimeout = 5 * time.Second
+	defer func() { upstreamModelsTimeout = old }()
+
+	// 生产注册方式：同一个 mux、同一个 healthHandler。
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// 先让一个上游调用真的挂住，复现「有在途请求卡死」的现场。
+	stuck := make(chan struct{})
+	go func() { defer close(stuck); fetchModels() }()
+	select {
+	case <-stuck:
+		t.Fatal("fetchModels 立即返回了，用例前提不成立")
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	for i := 1; i <= 3; i++ {
+		start := time.Now()
+		resp, err := client.Get(srv.URL + "/health")
+		if err != nil {
+			t.Fatalf("上游黑洞时 /health 第 %d 次请求失败: %v", i, err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("上游黑洞时 /health 应仍为 200，得到 %d", resp.StatusCode)
+		}
+		if d := time.Since(start); d > 2*time.Second {
+			t.Errorf("上游黑洞时 /health 第 %d 次用了 %s，探针不该被上游拖慢", i, d)
+		}
+	}
+}
+
+// TestUpstreamDialErrorRetryIsBounded 钉住根因之二：client.Do 出网络层错误时，
+// 重试循环原来是无条件 continue —— 不查 attempts、不退避、不打日志。上游一挂
+// 就变成满 CPU 死循环，且日志里一个字都看不到。必须有限次后放弃并返回。
+func TestUpstreamDialErrorRetryIsBounded(t *testing.T) {
+	ocOnce.Do(func() {})
+	quotaBreakerMu.Lock()
+	quotaBreakers = map[string]*quotaBreakerEntry{}
+	quotaBreakerMu.Unlock()
+	applyConfig(AppConfig{OCSessionID: testSession})
+	t.Cleanup(func() { applyConfig(AppConfig{}) })
+	// 端口 1 必然连不上：每次 client.Do 立刻返回错误，正好压这条分支。
+	pointUpstreamAt(t, "http://127.0.0.1:1")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		callOpenCodeAPI(context.Background(),
+			map[string]any{"model": "cmp119-probe"}, "cmp119-probe")
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("上游 dial 持续失败时应尽快放弃（旧实现是无限热重试，永远不返回）")
+	}
+}
+
+// goneWriter 模拟客户端已经消失的下游：每次写都返回 EPIPE 类的错误。
+type goneWriter struct{ h http.Header }
+
+func (g *goneWriter) Header() http.Header       { return g.h }
+func (g *goneWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+func (g *goneWriter) WriteHeader(int)           {}
+
+// TestClaudeStreamStopsWhenClientDisconnects 钉住根因之三：SSE handler 原来
+// 丢弃写错误，客户端（面板刷新/切页）走了以后 handler 仍一路读到上游 EOF，
+// goroutine 与上游连接一起泄漏。面板反复刷新累积起来，fd 被吃光后 accept
+// 停摆 —— 端口还 LISTEN、进程还在、CPU 静止，但所有 HTTP 请求零响应。
+// 上游流永不结束时，旧实现在这条用例上就是永久不返回。
+func TestClaudeStreamStopsWhenClientDisconnects(t *testing.T) {
+	pr, pw := io.Pipe()
+	upstreamClosed := make(chan struct{})
+	// 上游无限流：只有 handler 自己退出才会关掉读端。
+	go func() {
+		defer close(upstreamClosed)
+		chunk := `data: {"choices":[{"delta":{"content":"x"}}]}` + "\n"
+		for {
+			if _, err := pw.Write([]byte(chunk)); err != nil {
+				return
+			}
+		}
+	}()
+
+	// body 一旦被 Close，writer 侧立刻拿到 ErrClosedPipe —— 用来证明上游连接被释放。
+	body := &closeNotifyReader{Reader: pr, closed: make(chan struct{})}
+	w := &goneWriter{h: http.Header{}}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// 生产调用点就是 defer upResp.Close() + claudeStreamHandler(...)：
+		// handler 返回 ⇒ 上游连接才被释放。
+		defer body.Close()
+		claudeStreamHandler(w, body, "cmp119-probe", "cmp119-probe", "test")
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("客户端已断开，claudeStreamHandler 仍不返回（写错误被丢弃 → goroutine 与上游连接泄漏）")
+	}
+	select {
+	case <-body.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler 返回后上游 body 应被关闭，实际没关（连接泄漏）")
+	}
+	pw.Close()
+	<-upstreamClosed
+}
+
+type closeNotifyReader struct {
+	io.Reader
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *closeNotifyReader) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}

@@ -119,9 +119,69 @@ curl -s http://127.0.0.1:8000/v1/messages \
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `-port` | `8000` | 监听端口 |
+| `-listen` | 空 | 监听地址。**留空 = 绑全网卡**（与历史行为一致，容器靠 `ports:` 映射进来就靠它）；写 `127.0.0.1` 只绑回环；写非回环地址**必须同时设 `-password`**，否则拒绝启动 |
 | `-config` | `config.json` | 配置文件路径 |
 | `-password` | 空 | 管理面板密码；留空则不启用登录验证 |
 | `-debug` | `false` | 调试日志 |
+
+监听地址也可用环境变量 `OC_LISTEN_ADDR` 或配置里的 `listen_addr` 指定，优先级
+`-listen > OC_LISTEN_ADDR > config.listen_addr`；三者都空则沿用历史行为（`":"+port`）。
+
+> Android app 走的是另一条路：它**显式传** `-listen 127.0.0.1`（局域网开关打开才传 `0.0.0.0`
+> 并强制面板密码），所以手机上默认只对本机可见，而服务器部署的默认行为一字未变。
+> 本地 app 的安全默认由调用方承担，不改库的默认值——已有部署（含现网容器）升级后不受影响。
+
+## Android
+
+手机上本地跑代理，界面直接复用自带管理面板（WebView），不需要服务器。
+
+### 安装与启动
+
+1. 从 [Releases](../../releases) 下载 `oc2api-android-<version>.apk` 安装
+   （`arm64-v8a` 真机 / `x86_64` 模拟器都在同一个包里）。
+2. 打开 app → 设端口（默认 8000）→ 点 **启动**。
+3. 常驻通知出现即代理已就绪；下方 WebView 会加载面板，地址是
+   `http://127.0.0.1:8000/`。面板能直接读写配置（会话、别名、出口、凭据池）。
+
+### 给手机内其它 app 用
+
+把目标 app 的 base_url 指到本机：
+
+```
+http://127.0.0.1:8000/v1/chat/completions   # OpenAI 协议
+http://127.0.0.1:8000/v1/messages           # Anthropic 协议（Claude Code）
+```
+
+两点容易踩：
+
+- 目标 app 自己也要允许到 `127.0.0.1` 的**明文 HTTP**（Android 9+ 默认禁明文）。
+  本 app 已用 `network_security_config.xml` 按域放行，但那只管本 app。
+- 本机回环地址只有同机 app 能访问，别的设备要走局域网模式。
+
+### 局域网共享（默认关闭）
+
+局域网模式打开后代理绑 `0.0.0.0`，同一 Wi-Fi 下的设备就能用
+`http://<手机IP>:8000/v1/...`。
+
+> ⚠️ **面板密码在局域网模式下是强制的**（app 与代理侧各拦一次）：面板能改上游会话与
+> 凭据池，无密码地暴露到局域网等于把凭据送人。默认关闭时只绑 `127.0.0.1`，
+> 外部设备一律连不上。
+
+### 长时后台
+
+系统进入 Doze 会掐掉应用的网络访问，代理就接不上上游。app 里有个
+**忽略电池优化** 按钮，装机后点一次；否则「关屏 30 分钟后仍可用」只在插着电时成立。
+
+### 构建（新 ABI / 自定义）
+
+发布由 CI 完成：`.github/workflows/android-apk.yml` 先用 NDK
+`CGO_ENABLED=1 GOOS=android` 交叉编译出 `liboc2api.so`，再 `gradle assembleRelease`
+签名出包。本机不需要 Go / NDK / Gradle。
+
+签名：CI 优先用仓库 secrets 里的 `ANDROID_KEYSTORE_B64` / `STORE_PASSWORD` /
+`KEY_ALIAS` / `KEY_PASSWORD`；没有就临时自签一份，**签名身份每次运行都不同，
+不同次构建的 APK 不能互相覆盖安装** —— 要长期分发请在 secrets 里配一份固定 keystore。
+keystore 与 APK 一律不入库。
 
 ## 构建
 
@@ -134,6 +194,7 @@ go vet ./... && go test ./...       # 检查 + 单测
 
 - [`build-release.yml`](.github/workflows/build-release.yml)：推送 `v*` tag → 5 平台二进制 + `sha256sums.txt` → GitHub Release（也支持手动触发验证）
 - [`docker-ghcr.yml`](.github/workflows/docker-ghcr.yml)：构建 `linux/amd64` + `linux/arm64` 镜像推送 GHCR（main → `latest`，tag → 语义化版本）
+- [`android-apk.yml`](.github/workflows/android-apk.yml)：推送 `v*` tag → NDK 交叉编译 + Gradle 出签名 APK → artifact（tag 时附到 Release）
 
 ## License
 

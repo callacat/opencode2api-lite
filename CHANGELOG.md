@@ -4,6 +4,32 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **Android APK 形态（CMP-111）**：同仓新增 `android/` Gradle 子工程与
+  `.github/workflows/android-apk.yml`，把代理以静态二进制形式打进 APK，手机上本地跑，
+  WebView 直接复用自带管理面板，无需服务器。
+  - 代理源码**一行业务逻辑未动**；Android 侧只做「拉起进程 + 看守重启 + 显示面板」。
+  - 打包路径：`CGO_ENABLED=1 GOOS=android GOARCH=arm64|amd64` NDK 交叉编译 →
+    `jniLibs/<abi>/liboc2api.so`（lib 前缀 + .so 后缀，系统安装时才会解压到
+    `nativeLibraryDir`，那是 Android 10+ W^X 下少数允许 exec 的目录）。
+  - 前台服务用 `specialUse` 而非 `dataSync`：后者在 Android 15+ 受 6h/24h 总时长上限，
+    到点会被系统杀掉。
+  - 子进程看守：`START_STICKY` + 退出后 1s/2s/4s/8s/15s/30s 退避重启，活过 30s 清零退避。
+  - 产物：`oc2api-android-<version>.apk`（arm64-v8a + x86_64），CI 内 `apksigner verify`
+    + `sha256sum`，tag 推送时附到对应 Release。
+
+### 变更
+
+- **新增 `-listen` 参数 / `OC_LISTEN_ADDR` 环境变量 / `listen_addr` 配置字段**，用来显式指定
+  监听地址，优先级 `-listen > OC_LISTEN_ADDR > config.listen_addr`。
+  - **默认行为不变**：三者都留空时仍是 `addr := ":"+port`（绑全网卡），已有部署升级后监听行为
+    一字不变 —— 改库的默认值会波及所有消费者（现网容器就不传 `-listen`），故默认值刻意不动。
+  - 显式写了非回环地址却没有 `-password` 时**拒绝启动**（`validateListenAddr`）：面板能改上游会话
+    与凭据池，裸暴露等于把凭据送人。只对显式传参的调用方生效，老部署不受影响。
+  - Android app 靠这条参数把自己的默认收紧成 `127.0.0.1`（局域网开关打开才传 `0.0.0.0`
+    并强制面板密码）——本地 app 的安全默认由调用方承担。
+
 ### 修复
 
 - **403 `FreeTierError` 不进自愈重试，单把失效凭据能卡死整机**（CMP-110，根因来自 CMP-109 分诊）。
