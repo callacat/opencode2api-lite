@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1510,4 +1511,68 @@ func TestUpstreamDialErrorRetryIsBounded(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("上游 dial 持续失败时应尽快放弃（旧实现是无限热重试，永远不返回）")
 	}
+}
+
+// goneWriter 模拟客户端已经消失的下游：每次写都返回 EPIPE 类的错误。
+type goneWriter struct{ h http.Header }
+
+func (g *goneWriter) Header() http.Header       { return g.h }
+func (g *goneWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+func (g *goneWriter) WriteHeader(int)           {}
+
+// TestClaudeStreamStopsWhenClientDisconnects 钉住根因之三：SSE handler 原来
+// 丢弃写错误，客户端（面板刷新/切页）走了以后 handler 仍一路读到上游 EOF，
+// goroutine 与上游连接一起泄漏。面板反复刷新累积起来，fd 被吃光后 accept
+// 停摆 —— 端口还 LISTEN、进程还在、CPU 静止，但所有 HTTP 请求零响应。
+// 上游流永不结束时，旧实现在这条用例上就是永久不返回。
+func TestClaudeStreamStopsWhenClientDisconnects(t *testing.T) {
+	pr, pw := io.Pipe()
+	upstreamClosed := make(chan struct{})
+	// 上游无限流：只有 handler 自己退出才会关掉读端。
+	go func() {
+		defer close(upstreamClosed)
+		chunk := `data: {"choices":[{"delta":{"content":"x"}}]}` + "\n"
+		for {
+			if _, err := pw.Write([]byte(chunk)); err != nil {
+				return
+			}
+		}
+	}()
+
+	// body 一旦被 Close，writer 侧立刻拿到 ErrClosedPipe —— 用来证明上游连接被释放。
+	body := &closeNotifyReader{Reader: pr, closed: make(chan struct{})}
+	w := &goneWriter{h: http.Header{}}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// 生产调用点就是 defer upResp.Close() + claudeStreamHandler(...)：
+		// handler 返回 ⇒ 上游连接才被释放。
+		defer body.Close()
+		claudeStreamHandler(w, body, "cmp119-probe", "cmp119-probe", "test")
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("客户端已断开，claudeStreamHandler 仍不返回（写错误被丢弃 → goroutine 与上游连接泄漏）")
+	}
+	select {
+	case <-body.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler 返回后上游 body 应被关闭，实际没关（连接泄漏）")
+	}
+	pw.Close()
+	<-upstreamClosed
+}
+
+type closeNotifyReader struct {
+	io.Reader
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *closeNotifyReader) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
 }

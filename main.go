@@ -3525,7 +3525,14 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}()
 		doneSeen := false
+		// CMP-119：客户端断开后写端立即报错，收到就退出循环，别读到上游 EOF
+		// 才罢手（上游流可以一直开着，那样 goroutine 与连接永不释放）。
+		var clientGone bool
 		for {
+			if clientGone {
+				log.Printf("%s client gone mid-stream, stop reading upstream", reqLabel(cnt, r))
+				return
+			}
 			line, err := reader.ReadString('\n')
 			if err != nil {
 				if err == io.EOF {
@@ -3545,7 +3552,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			trimmed := strings.TrimSpace(line)
 			if trimmed == "data: [DONE]" {
 				doneSeen = true
-				w.Write([]byte("data: [DONE]\n\n"))
+				if _, werr := w.Write([]byte("data: [DONE]\n\n")); werr != nil {
+					clientGone = true
+					log.Printf("%s client gone mid-stream: %v", reqLabel(cnt, r), werr)
+					continue
+				}
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
 				}
@@ -3576,7 +3587,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			io.WriteString(w, out+"\n")
+			if _, werr := io.WriteString(w, out+"\n"); werr != nil {
+				clientGone = true
+				log.Printf("%s client gone mid-stream: %v", reqLabel(cnt, r), werr)
+				continue
+			}
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
@@ -4209,13 +4224,24 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 		}
 	}()
 
+	var clientGone bool
 	emitClaudeEvent := func(event string, data any) {
+		if clientGone {
+			return
+		}
 		jsonData, err := json.Marshal(data)
 		if err != nil {
 			log.Printf("Error marshaling Claude SSE event: %v", err)
 			return
 		}
-		io.WriteString(w, "event: "+event+"\ndata: "+string(jsonData)+"\n\n")
+		if _, err := io.WriteString(w, "event: "+event+"\ndata: "+string(jsonData)+"\n\n"); err != nil {
+			// CMP-119：客户端断开后写端立即报错。原来写错误被丢弃，
+			// handler 一直读到上游 EOF 才返回，goroutine 和上游连接一起泄漏；
+			// 面板反复刷新/切页累积起来就是 fd 被吃光、accept 停摆。
+			clientGone = true
+			log.Printf("%s client gone mid-stream: %v", label, err)
+			return
+		}
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -4262,6 +4288,9 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 	}
 
 	for {
+		if clientGone {
+			return
+		}
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
