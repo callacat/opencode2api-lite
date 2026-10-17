@@ -1036,3 +1036,113 @@ func TestFreeTier403PassesThroughWhenBudgetExhausted(t *testing.T) {
 // 而那种模式下 getHTTPClient 会把请求交给 SOCKS5 dialer，假上游够不着，单测钉不住。
 // 该策略由代码（`if !freeTier403 { rotateSocks5OnRateLimit }`）与金丝雀日志的 `exit=`
 // 字段（403 那一发与重试那一发必须相同）共同覆盖。
+
+// TestHasNewerVersion 钉住 tag 归一化：CI 注入的 version 与 GitHub tag_name 都是 tag，
+// 但只要有任一侧漏了 "v" 前缀，versionNumbers 逐段只吃数字字符就会把 "v1.0.4" 读成
+// [0,0,4]，与 [1,0,4] 不等 —— 同版本会被误报「有更新」、低版本也可能被当成新版。
+func TestHasNewerVersion(t *testing.T) {
+	cases := []struct {
+		current, latest string
+		want            bool
+	}{
+		{"v1.0.4", "v1.0.5", true},
+		{"v1.0.4", "v1.0.4", false},
+		{"1.0.4", "v1.0.4", false},
+		{"v1.0.4", "1.0.4", false},
+		{"v1.0.4", "v1.0.3", false},
+		{"v1.0.4", "1.0.0", false}, // 不归一化会读成 false positive
+		{"v1.0.9", "v1.1.0", true},
+		{"dev", "v1.0.5", false},
+		{"", "v1.0.5", false},
+		{"v1.0.4", "", false},
+	}
+	for _, c := range cases {
+		if got := hasNewerVersion(c.current, c.latest); got != c.want {
+			t.Errorf("hasNewerVersion(%q, %q) = %v, want %v", c.current, c.latest, got, c.want)
+		}
+	}
+}
+
+// TestAdminVersionHandler 钉住面板契约：当前版本 + 最新版本 + 是否有更新 + release 链接。
+func TestAdminVersionHandler(t *testing.T) {
+	oldFetch, oldVersion := fetchLatestRelease, version
+	defer func() { fetchLatestRelease, version = oldFetch, oldVersion }()
+	version = "v1.0.4"
+	fetchLatestRelease = func(context.Context) (latestRelease, error) {
+		return latestRelease{Tag: "v1.0.5", URL: "https://example.invalid/releases/tag/v1.0.5"}, nil
+	}
+	releaseMu.Lock()
+	releaseCached = false
+	releaseMu.Unlock()
+
+	rec := httptest.NewRecorder()
+	adminVersionHandler(rec, httptest.NewRequest(http.MethodGet, "/api/version", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET 应 200，得到 %d", rec.Code)
+	}
+	var st versionStatus
+	if err := json.NewDecoder(rec.Body).Decode(&st); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v", err)
+	}
+	if st.Version != "v1.0.4" || st.Latest != "v1.0.5" || !st.HasUpdate || st.ReleaseURL == "" || st.CheckedAt == "" {
+		t.Fatalf("版本自检响应不符: %+v", st)
+	}
+
+	rec2 := httptest.NewRecorder()
+	adminVersionHandler(rec2, httptest.NewRequest(http.MethodPost, "/api/version", nil))
+	if rec2.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST 应 405，得到 %d", rec2.Code)
+	}
+}
+
+// TestVersionCheckCache 钉住「连点只打一次 GitHub」：未认证 api.github.com 限
+// 60 次/小时/IP，缓存失效的话运营多点几下就能把额度打满（然后面板长期「检查失败」）。
+func TestVersionCheckCache(t *testing.T) {
+	oldFetch, oldTTL := fetchLatestRelease, releaseCheckTTL
+	defer func() { fetchLatestRelease, releaseCheckTTL = oldFetch, oldTTL }()
+	releaseCheckTTL = 30 * time.Minute
+
+	var calls int32
+	fetchLatestRelease = func(context.Context) (latestRelease, error) {
+		atomic.AddInt32(&calls, 1)
+		return latestRelease{Tag: "v1.0.5", URL: "https://example.invalid/rel"}, nil
+	}
+	releaseMu.Lock()
+	releaseCached = false
+	releaseMu.Unlock()
+
+	for i := 0; i < 5; i++ {
+		if got := checkLatestVersion(context.Background()); got.Latest != "v1.0.5" || got.Error != "" {
+			t.Fatalf("第 %d 次查询异常: %+v", i, got)
+		}
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("TTL 内连查 5 次应只出站 1 次，实际 %d 次", n)
+	}
+
+	// TTL 过期后应重新出站
+	releaseMu.Lock()
+	releaseAt = time.Now().Add(-31 * time.Minute)
+	releaseMu.Unlock()
+	checkLatestVersion(context.Background())
+	if n := atomic.LoadInt32(&calls); n != 2 {
+		t.Fatalf("TTL 过期后应重新出站，实际累计 %d 次", n)
+	}
+
+	// 失败结果同样进缓存：否则每次面板加载都会去撞一个连不通的 GitHub
+	fetchLatestRelease = func(context.Context) (latestRelease, error) {
+		atomic.AddInt32(&calls, 1)
+		return latestRelease{}, fmt.Errorf("boom")
+	}
+	releaseMu.Lock()
+	releaseCached = false
+	releaseMu.Unlock()
+	for i := 0; i < 3; i++ {
+		if st := checkLatestVersion(context.Background()); st.Error != "检查失败" || st.HasUpdate {
+			t.Fatalf("失败应静默降级为「检查失败」: %+v", st)
+		}
+	}
+	if n := atomic.LoadInt32(&calls); n != 3 {
+		t.Fatalf("失败结果也应缓存（3 次查询共 1 次出站），实际累计 %d 次", n)
+	}
+}

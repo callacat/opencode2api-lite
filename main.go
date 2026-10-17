@@ -6086,6 +6086,13 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 .effort-row .btn{padding:6px 10px;font-size:11px}
 .effort-empty{padding:16px 8px;color:var(--text-ter);font-size:12px;text-align:center;border:1px dashed var(--border);border-radius:6px}
 .effort-actions{margin-top:10px}
+.ver-chip{display:flex;align-items:center;gap:8px;padding:6px 12px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;color:var(--text-sec);white-space:nowrap;flex-shrink:0}
+.ver-chip b{font-family:var(--mono);font-weight:600;color:var(--text)}
+.ver-chip a{color:var(--orange);font-weight:500;text-decoration:none}
+.ver-chip a:hover{text-decoration:underline}
+.ver-chip .up{color:var(--orange);font-weight:600}
+.ver-chip .ok{color:var(--green);font-weight:500}
+.ver-chip .fail{color:var(--text-ter)}
 </style>
 </head>
 <body>
@@ -6099,6 +6106,8 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 </div>
 </div>
 <div style="display:flex;align-items:center;gap:8px">
+<span class="ver-chip"><b id="verCur" title="当前版本">…</b><span id="verStatus"></span></span>
+<button class="theme-toggle" id="verCheckBtn" onclick="checkUpdate()" title="检查更新" style="font-size:12px;padding:6px 10px">检查更新</button>
 <button class="theme-toggle" onclick="toggleTheme()" title="切换主题">☀</button>
 <form method="post" action="/logout" style="margin:0"><button class="theme-toggle" type="submit" title="退出登录" style="font-size:14px">退出</button></form>
 </div>
@@ -6203,7 +6212,10 @@ function esc(s){const d=document.createElement('div');d.textContent=s;return d.i
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
 async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await fetch('/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}
 async function loadStats(){try{const r=await fetch('/api/stats');const d=await r.json();const ms=d.models||{};const ks=Object.keys(ms);const dm=d.daily?d.daily.models||{}:{};const dk=Object.keys(dm);let h='';if(d.daily&&d.daily.date){h+='<div style="margin-bottom:16px;padding:10px 14px;background:var(--accent);color:#fff;border-radius:8px;font-size:13px">📊 今日统计 ('+esc(d.daily.date)+')：请求 '+fmt(d.daily.total_requests)+' 次</div>'}if(dk.length>0){h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">今日模型用量</h3><table class="tbl" id="dailyTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';let dr=0,dp=0,dc=0,dt=0;for(const k of dk){const m=dm[k];if(!m)continue;h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';dr+=m.request_count;dp+=m.prompt_tokens;dc+=m.completion_tokens;dt+=m.total_tokens}h+='<tr style="font-weight:600"><td>今日合计</td><td>'+fmt(dr)+'</td><td>'+fmt(dp)+'</td><td>'+fmt(dc)+'</td><td>'+fmt(dt)+'</td></tr>';h+='</tbody></table><hr style="border:none;border-top:1px solid var(--border);margin:20px 0">'}h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">累计统计</h3><table class="tbl" id="statsTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';if(!ks.length){h+='<tr><td colspan="5" class="empty-hint">暂无数据</td></tr>'}else{let tr=0,pt=0,ct=0,tt=0;for(const k of ks){const m=ms[k];h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';tr+=m.request_count;pt+=m.prompt_tokens;ct+=m.completion_tokens;tt+=m.total_tokens}h+='<tr style="font-weight:600"><td>累计总计</td><td>'+fmt(tr)+'</td><td>'+fmt(pt)+'</td><td>'+fmt(ct)+'</td><td>'+fmt(tt)+'</td></tr>'}h+='</tbody></table>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}
-function fmt(n){return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g,',')}window.onload=function(){loadConfig();loadStats()};setInterval(loadStats,5000);document.addEventListener('visibilitychange',function(){if(!document.hidden){loadStats()}});
+let verBusy=false;
+function renderVersion(d){const cur=document.getElementById('verCur'),st=document.getElementById('verStatus');const v=d.version||'dev';cur.textContent=v;cur.title=v==='dev'?'本地构建，未注入版本号':'当前版本 '+v;st.textContent='';st.className='';if(d.error){st.textContent='检查失败';st.className='fail';return}if(d.has_update){st.className='up';st.textContent='有新版本 '+d.latest+' ';const a=document.createElement('a');a.href=d.release_url||'https://github.com/callacat/opencode2api-lite/releases/latest';a.target='_blank';a.rel='noopener';a.textContent='查看';st.appendChild(a);return}if(v==='dev'){st.textContent='未注入版本';st.className='fail';return}st.textContent='已是最新';st.className='ok'}
+async function checkUpdate(silent){if(verBusy)return;verBusy=true;const b=document.getElementById('verCheckBtn'),label=b.textContent;b.disabled=true;b.textContent='检查中…';try{const r=await fetch('/api/version');const d=await r.json();renderVersion(d);if(silent)return;if(d.error)showToast('检查更新失败','error');else if(d.has_update)showToast('发现新版本 '+d.latest,'error');else showToast('已是最新','success')}catch(e){const st=document.getElementById('verStatus');st.textContent='检查失败';st.className='fail';if(!silent)showToast('检查更新失败','error')}finally{b.disabled=false;b.textContent=label;verBusy=false}}
+function fmt(n){return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g,',')}window.onload=function(){loadConfig();loadStats();checkUpdate(true)};setInterval(loadStats,5000);document.addEventListener('visibilitychange',function(){if(!document.hidden){loadStats()}});
 </script>
 </body>
 </html>`
@@ -6227,6 +6239,129 @@ func initializeOpenCode() {
 // version 由构建时注入（-ldflags "-X main.version=..."，取 release tag），
 // 未注入时（本地 go build）为 dev。版本单一来源 = git tag。
 var version = "dev"
+
+// ======================== 版本自检 ========================
+
+const releaseRepo = "callacat/opencode2api-lite"
+
+// releaseCheckTTL 是 GitHub 查询结果（成功与失败同用）的缓存时长。
+// api.github.com 未认证限 60 次/小时/IP，面板每开一次都打一次会很快打满，
+// 故成功和失败都缓存：最坏 2 次/小时。
+var releaseCheckTTL = 30 * time.Minute
+
+type latestRelease struct {
+	Tag string `json:"tag_name"`
+	URL string `json:"html_url"`
+}
+
+// fetchLatestRelease 是真正出站的那一步，测试里替换掉即可离线验证缓存行为。
+var fetchLatestRelease = func(ctx context.Context) (latestRelease, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"https://api.github.com/repos/"+releaseRepo+"/releases/latest", nil)
+	if err != nil {
+		return latestRelease{}, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	client, _, err := getHTTPClient(ctx)
+	if err != nil {
+		return latestRelease{}, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return latestRelease{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return latestRelease{}, fmt.Errorf("github 返回 %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return latestRelease{}, err
+	}
+	var rel latestRelease
+	if err := json.Unmarshal(body, &rel); err != nil {
+		return latestRelease{}, err
+	}
+	if rel.Tag == "" {
+		return latestRelease{}, errors.New("github 响应缺少 tag_name")
+	}
+	return rel, nil
+}
+
+var (
+	releaseMu     sync.Mutex
+	releaseCache  latestRelease
+	releaseCached bool
+	releaseAt     time.Time
+	releaseErr    error
+)
+
+func cachedLatestRelease(ctx context.Context) (latestRelease, time.Time, error) {
+	releaseMu.Lock()
+	defer releaseMu.Unlock()
+	if releaseCached && time.Since(releaseAt) < releaseCheckTTL {
+		return releaseCache, releaseAt, releaseErr
+	}
+	rel, err := fetchLatestRelease(ctx)
+	releaseAt, releaseErr = time.Now(), err
+	if err == nil {
+		releaseCache = rel
+		log.Printf("检查更新: GitHub releases/latest = %s", rel.Tag)
+	} else {
+		log.Printf("检查更新: 查询 GitHub 失败（%v），%s 内不再重试", err, releaseCheckTTL)
+	}
+	releaseCached = true
+	return releaseCache, releaseAt, err
+}
+
+// hasNewerVersion 判断 latest 是否比 current 新。
+// 两侧都先去掉 tag 前缀 "v"：versionNumbers 逐段只吃数字字符，
+// "v1.0.4" 首段非数字即 break 会被解析成 [0,0,4]，与 "1.0.4" = [1,0,4] 不等，
+// 不归一化会把同版本误报成「有更新」。
+func hasNewerVersion(current, latest string) bool {
+	current = strings.TrimPrefix(strings.TrimSpace(current), "v")
+	latest = strings.TrimPrefix(strings.TrimSpace(latest), "v")
+	if current == "" || latest == "" || current == "dev" {
+		return false
+	}
+	return compareVersion(latest, current) > 0
+}
+
+type versionStatus struct {
+	Version    string `json:"version"`
+	Latest     string `json:"latest,omitempty"`
+	HasUpdate  bool   `json:"has_update"`
+	ReleaseURL string `json:"release_url,omitempty"`
+	CheckedAt  string `json:"checked_at,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+func checkLatestVersion(ctx context.Context) versionStatus {
+	st := versionStatus{Version: strings.TrimSpace(version)}
+	rel, at, err := cachedLatestRelease(ctx)
+	if err != nil {
+		st.Error = "检查失败"
+		return st
+	}
+	st.Latest = rel.Tag
+	st.ReleaseURL = rel.URL
+	st.CheckedAt = at.UTC().Format(time.RFC3339)
+	st.HasUpdate = hasNewerVersion(st.Version, rel.Tag)
+	return st
+}
+
+// adminVersionHandler 供面板显示当前版本与是否有新版本。
+// 出站失败一律降级为 error 字段，不阻塞、不影响其它端点。
+func adminVersionHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(checkLatestVersion(r.Context()))
+}
 
 func main() {
 	flag.StringVar(&port, "port", "8000", "服务端口")
@@ -6275,6 +6410,7 @@ func main() {
 	http.HandleFunc("/api/stats", requireAuth(adminStatsHandler))
 	http.HandleFunc("/api/reload", requireAuth(reloadHandler))
 	http.HandleFunc("/api/models", requireAuth(adminModelsHandler))
+	http.HandleFunc("/api/version", requireAuth(adminVersionHandler))
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
