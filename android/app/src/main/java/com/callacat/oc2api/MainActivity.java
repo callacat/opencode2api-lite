@@ -345,12 +345,10 @@ public class MainActivity extends AppCompatActivity {
 
     /** 尊重系统「移除动画」：动画时长被拉到 0 时一律不播。 */
     private boolean animationsEnabled() {
-        try {
-            return Settings.Global.getFloat(
-                    getContentResolver(), Settings.Global.ANIMATOR_DURATION_SCALE, 1f) > 0f;
-        } catch (Settings.SettingNotFoundException e) {
-            return true;
-        }
+        // 带默认值的三参重载本身不抛 SettingNotFoundException（只有两参版才抛），
+        // 所以这里不需要 try/catch —— 上一版多包一层反而编译不过（CI run 39030826223）。
+        return Settings.Global.getFloat(
+                getContentResolver(), Settings.Global.ANIMATOR_DURATION_SCALE, 1f) > 0f;
     }
 
     // ======================== 日志 ========================
