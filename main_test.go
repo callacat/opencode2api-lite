@@ -806,6 +806,10 @@ func TestQuotaBreakerFastFailsAfterThreshold(t *testing.T) {
 // 403 形态原先落透传分支：不换出口、不换凭据、且零日志 —— 出口抽到持续报错的节点
 // 会永久卡死。判据必须只认 message：同一个 type:"server_error" 下 `Model is unavailable`
 // 是模型已下线的永久错误，拖进重试只会白烧额度。
+//
+// CMP-129 起本节的行为用例改道：两个形态统一归入「端点/模型级不可用」→ 按模型熔断
+// 快速失败（见下一节）。但**判定函数本身没变**，`TestIsRetryableQuotaUpstream` 仍是
+// CMP-86 留下的判据表，原样通过。
 
 const transientBody = `{"error":{"type":"server_error","message":"Upstream request failed: Endpoint is unavailable."}}`
 const modelGoneBody = `{"error":{"type":"server_error","message":"Model is unavailable."}}`
@@ -837,45 +841,156 @@ func writeTransient403(w http.ResponseWriter, _ *http.Request) {
 	w.Write([]byte(transientBody))
 }
 
-// TestTransient403RetriesThenPassesThrough：403 瞬时类要换出口/换凭据重试到预算用尽，
-// 失败后仍把**上游原始 403 + body** 透传（不得改写成 502）。
-func TestTransient403RetriesThenPassesThrough(t *testing.T) {
+func writeTransient429(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusTooManyRequests)
+	w.Write([]byte(transientBody))
+}
+
+// ======================== 端点/模型级不可用（CMP-129） ========================
+//
+// 上游把同一份 `Endpoint is unavailable` body 用 429/403 两种状态码回过
+// （CMP-46 记录 403 形态，CMP-129 现场是 429 形态），所以两个形态走同一个判定函数。
+//
+// 为什么不再轮转（2026-10-17 现网实测，非推测）：
+//   - 现网同一时刻 k1→k16 逐字同一句，连打 16 把凭据零变化；
+//   - 同一把 key 在 10 个**不同** OC 出口节点上也零救回（direct 腿 200×4 后转本形态，
+//     OC 腿 10 发 403/真配额混杂、零 200）—— 换出口这条真修法在本形态上不成立。
+// ⇒ 单发只打一次上游、记按模型熔断；回 503 EndpointUnavailableError，与配额耗尽的
+//   429 FreeUsageLimitError 可区分（后者带 Retry-After）。429 + 空 Retry-After 会让
+//   客户端立刻重试打转，这是本形态必须单独成型的理由。
+
+// TestEndpointUnavailable429StopsAtOneUpstreamCall 判据 1：429 形态单发只打一次上游、
+// 不换 key、不进「换出口重试」，并回可与真配额区分的 503。
+func TestEndpointUnavailable429StopsAtOneUpstreamCall(t *testing.T) {
+	quotaCase(t)
+	hits, restore := fakeUpstream(t, writeTransient429)
+	defer restore()
+
+	body, status, hdr, err := callOpenCodeAPI(context.Background(),
+		map[string]any{"model": "space-bunny-free", "stream": true}, "space-bunny-free")
+	if err == nil {
+		t.Fatal("端点不可用应以失败返回，得到 nil error")
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("端点不可用只该打 1 次上游（不轮转凭据），实际 %d 次", got)
+	}
+	if k, ok := pickOCKey(testSession); !ok || k.id != "k1" {
+		t.Fatalf("不该轮转凭据，会话应仍绑在 k1，得到 %q", k.id)
+	}
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("应回 503（与真配额 429 可区分），得到 %d", status)
+	}
+	if got := hdr.Get("Retry-After"); got != "" {
+		t.Fatalf("端点不可用不该带 Retry-After（空值会让客户端打转），得到 %q", got)
+	}
+	if !strings.Contains(string(body), "EndpointUnavailableError") {
+		t.Fatalf("body 应是端点不可用形态，得到 %s", body)
+	}
+}
+
+// TestEndpointUnavailableOpensBreaker 判据 3：同模型连撞到阈值后熔断，
+// 后续请求连上游都不打，快失败仍是 503 形态（不是配额的 429）。
+func TestEndpointUnavailableOpensBreaker(t *testing.T) {
+	quotaCase(t)
+	hits, restore := fakeUpstream(t, writeTransient429)
+	defer restore()
+
+	for i := 1; i <= quotaBreakerThreshold; i++ {
+		if _, status, _, _ := callOpenCodeAPI(context.Background(),
+			map[string]any{"model": "space-bunny-free"}, "space-bunny-free"); status != http.StatusServiceUnavailable {
+			t.Fatalf("第 %d 发撞端点不可用，应回 503，得到 %d", i, status)
+		}
+	}
+	if got := hits.Load(); got != int64(quotaBreakerThreshold) {
+		t.Fatalf("熔断前每发应各打 1 次上游，实际 %d 次", got)
+	}
+
+	before := hits.Load()
+	body, status, _, err := callOpenCodeAPI(context.Background(),
+		map[string]any{"model": "space-bunny-free"}, "space-bunny-free")
+	if got := hits.Load(); got != before {
+		t.Fatalf("熔断打开后不该再打上游，多打了 %d 次", got-before)
+	}
+	if err == nil || status != http.StatusServiceUnavailable {
+		t.Fatalf("熔断快失败应回 503 + error，得到 status=%d err=%v", status, err)
+	}
+	if !strings.Contains(string(body), "EndpointUnavailableError") {
+		t.Fatalf("熔断快失败应是端点不可用形态，得到 %s", body)
+	}
+}
+
+// TestEndpointUnavailable403SamePath 判据 3 的 403 侧：CMP-86 当初让 403 形态进轮转，
+// 现按同一判定归入同一条熔断快速失败路径（两个状态码形态不再走两套行为）。
+func TestEndpointUnavailable403SamePath(t *testing.T) {
 	quotaCase(t)
 	hits, restore := fakeUpstream(t, writeTransient403)
 	defer restore()
 
-	body, status, _, err := callOpenCodeAPI(context.Background(),
+	_, status, _, _ := callOpenCodeAPI(context.Background(),
 		map[string]any{"model": "space-bunny-free"}, "space-bunny-free")
-	want := int64(keyPoolDefaultRetries + 1) // 与凭据级 429 同一重试预算
-	if got := hits.Load(); got != want {
-		t.Fatalf("403 瞬时错误应重试到预算用尽（%d 次上游），实际 %d 次", want, got)
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("403 形态同样只该打 1 次上游，实际 %d 次", got)
 	}
-	if err == nil || status != http.StatusForbidden {
-		t.Fatalf("试满后应回上游原始 403 + error，得到 status=%d err=%v", status, err)
-	}
-	if !strings.Contains(string(body), "Endpoint is unavailable") {
-		t.Fatalf("应透传上游原始错误体，得到 %s", body)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("403 形态应回 503，得到 %d", status)
 	}
 }
 
-// TestTransient403RetriesStream：判据在流式入口同样生效（两处是各自独立的循环）。
-func TestTransient403RetriesStream(t *testing.T) {
+// TestEndpointUnavailableStreamSamePath：判据在流式入口同样生效（两处是各自独立的循环）。
+func TestEndpointUnavailableStreamSamePath(t *testing.T) {
 	quotaCase(t)
-	hits, restore := fakeUpstream(t, writeTransient403)
+	hits, restore := fakeUpstream(t, writeTransient429)
 	defer restore()
 
 	rc, status, _, _ := callOpenCodeAPIStream(context.Background(),
 		map[string]any{"model": "space-bunny-free"}, "space-bunny-free")
 	defer rc.Close()
-	if got := hits.Load(); got != int64(keyPoolDefaultRetries+1) {
-		t.Fatalf("流式入口的 403 瞬时错误也应重试到预算用尽，实际 %d 次上游", got)
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("流式入口也只该打 1 次上游，实际 %d 次", got)
 	}
-	if status != http.StatusForbidden {
-		t.Fatalf("流式入口应透传上游原始 403，得到 %d", status)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("流式入口应回 503，得到 %d", status)
 	}
 	b, _ := io.ReadAll(rc)
-	if !strings.Contains(string(b), "Endpoint is unavailable") {
-		t.Fatalf("流式入口应透传上游原始错误体，得到 %s", b)
+	if !strings.Contains(string(b), "EndpointUnavailableError") {
+		t.Fatalf("流式入口应是端点不可用形态，得到 %s", b)
+	}
+}
+
+// TestQuotaAndEndpointUnavailableAreDistinguishable 判据 2 + 4：同一个模型、同一个
+// 熔断计数下，两种 429 必须回出**可区分**的东西 —— 真配额 429 FreeUsageLimitError，
+// 端点不可用 503 EndpointUnavailableError。改一个判据不能把另一个砸掉。
+func TestQuotaAndEndpointUnavailableAreDistinguishable(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     int
+		body       string
+		wantStatus int
+		wantBody   string
+	}{
+		{"真配额 429（CMP-83 路径，回归）", http.StatusTooManyRequests, quotaTestBody, http.StatusTooManyRequests, "FreeUsageLimitError"},
+		{"端点不可用 429（CMP-129 路径）", http.StatusTooManyRequests, transientBody, http.StatusServiceUnavailable, "EndpointUnavailableError"},
+	}
+	for _, c := range cases {
+		quotaCase(t)
+		hits, restore := fakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(c.status)
+			w.Write([]byte(c.body))
+		})
+		body, status, _, err := callOpenCodeAPI(context.Background(),
+			map[string]any{"model": "space-bunny-free", "stream": true}, "space-bunny-free")
+		restore()
+		if err == nil || status != c.wantStatus {
+			t.Errorf("%s：期望 status=%d + error，得到 status=%d err=%v", c.name, c.wantStatus, status, err)
+		}
+		if !strings.Contains(string(body), c.wantBody) {
+			t.Errorf("%s：body 期望含 %s，得到 %s", c.name, c.wantBody, body)
+		}
+		if got := hits.Load(); got != 1 {
+			t.Errorf("%s：两种形态都只该打 1 次上游，实际 %d 次", c.name, got)
+		}
 	}
 }
 
@@ -1036,3 +1151,113 @@ func TestFreeTier403PassesThroughWhenBudgetExhausted(t *testing.T) {
 // 而那种模式下 getHTTPClient 会把请求交给 SOCKS5 dialer，假上游够不着，单测钉不住。
 // 该策略由代码（`if !freeTier403 { rotateSocks5OnRateLimit }`）与金丝雀日志的 `exit=`
 // 字段（403 那一发与重试那一发必须相同）共同覆盖。
+
+// TestHasNewerVersion 钉住 tag 归一化：CI 注入的 version 与 GitHub tag_name 都是 tag，
+// 但只要有任一侧漏了 "v" 前缀，versionNumbers 逐段只吃数字字符就会把 "v1.0.4" 读成
+// [0,0,4]，与 [1,0,4] 不等 —— 同版本会被误报「有更新」、低版本也可能被当成新版。
+func TestHasNewerVersion(t *testing.T) {
+	cases := []struct {
+		current, latest string
+		want            bool
+	}{
+		{"v1.0.4", "v1.0.5", true},
+		{"v1.0.4", "v1.0.4", false},
+		{"1.0.4", "v1.0.4", false},
+		{"v1.0.4", "1.0.4", false},
+		{"v1.0.4", "v1.0.3", false},
+		{"v1.0.4", "1.0.0", false}, // 不归一化会读成 false positive
+		{"v1.0.9", "v1.1.0", true},
+		{"dev", "v1.0.5", false},
+		{"", "v1.0.5", false},
+		{"v1.0.4", "", false},
+	}
+	for _, c := range cases {
+		if got := hasNewerVersion(c.current, c.latest); got != c.want {
+			t.Errorf("hasNewerVersion(%q, %q) = %v, want %v", c.current, c.latest, got, c.want)
+		}
+	}
+}
+
+// TestAdminVersionHandler 钉住面板契约：当前版本 + 最新版本 + 是否有更新 + release 链接。
+func TestAdminVersionHandler(t *testing.T) {
+	oldFetch, oldVersion := fetchLatestRelease, version
+	defer func() { fetchLatestRelease, version = oldFetch, oldVersion }()
+	version = "v1.0.4"
+	fetchLatestRelease = func(context.Context) (latestRelease, error) {
+		return latestRelease{Tag: "v1.0.5", URL: "https://example.invalid/releases/tag/v1.0.5"}, nil
+	}
+	releaseMu.Lock()
+	releaseCached = false
+	releaseMu.Unlock()
+
+	rec := httptest.NewRecorder()
+	adminVersionHandler(rec, httptest.NewRequest(http.MethodGet, "/api/version", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET 应 200，得到 %d", rec.Code)
+	}
+	var st versionStatus
+	if err := json.NewDecoder(rec.Body).Decode(&st); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v", err)
+	}
+	if st.Version != "v1.0.4" || st.Latest != "v1.0.5" || !st.HasUpdate || st.ReleaseURL == "" || st.CheckedAt == "" {
+		t.Fatalf("版本自检响应不符: %+v", st)
+	}
+
+	rec2 := httptest.NewRecorder()
+	adminVersionHandler(rec2, httptest.NewRequest(http.MethodPost, "/api/version", nil))
+	if rec2.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST 应 405，得到 %d", rec2.Code)
+	}
+}
+
+// TestVersionCheckCache 钉住「连点只打一次 GitHub」：未认证 api.github.com 限
+// 60 次/小时/IP，缓存失效的话运营多点几下就能把额度打满（然后面板长期「检查失败」）。
+func TestVersionCheckCache(t *testing.T) {
+	oldFetch, oldTTL := fetchLatestRelease, releaseCheckTTL
+	defer func() { fetchLatestRelease, releaseCheckTTL = oldFetch, oldTTL }()
+	releaseCheckTTL = 30 * time.Minute
+
+	var calls int32
+	fetchLatestRelease = func(context.Context) (latestRelease, error) {
+		atomic.AddInt32(&calls, 1)
+		return latestRelease{Tag: "v1.0.5", URL: "https://example.invalid/rel"}, nil
+	}
+	releaseMu.Lock()
+	releaseCached = false
+	releaseMu.Unlock()
+
+	for i := 0; i < 5; i++ {
+		if got := checkLatestVersion(context.Background()); got.Latest != "v1.0.5" || got.Error != "" {
+			t.Fatalf("第 %d 次查询异常: %+v", i, got)
+		}
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("TTL 内连查 5 次应只出站 1 次，实际 %d 次", n)
+	}
+
+	// TTL 过期后应重新出站
+	releaseMu.Lock()
+	releaseAt = time.Now().Add(-31 * time.Minute)
+	releaseMu.Unlock()
+	checkLatestVersion(context.Background())
+	if n := atomic.LoadInt32(&calls); n != 2 {
+		t.Fatalf("TTL 过期后应重新出站，实际累计 %d 次", n)
+	}
+
+	// 失败结果同样进缓存：否则每次面板加载都会去撞一个连不通的 GitHub
+	fetchLatestRelease = func(context.Context) (latestRelease, error) {
+		atomic.AddInt32(&calls, 1)
+		return latestRelease{}, fmt.Errorf("boom")
+	}
+	releaseMu.Lock()
+	releaseCached = false
+	releaseMu.Unlock()
+	for i := 0; i < 3; i++ {
+		if st := checkLatestVersion(context.Background()); st.Error != "检查失败" || st.HasUpdate {
+			t.Fatalf("失败应静默降级为「检查失败」: %+v", st)
+		}
+	}
+	if n := atomic.LoadInt32(&calls); n != 3 {
+		t.Fatalf("失败结果也应缓存（3 次查询共 1 次出站），实际累计 %d 次", n)
+	}
+}

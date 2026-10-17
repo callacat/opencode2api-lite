@@ -6,6 +6,31 @@
 
 ### 修复
 
+- **`Endpoint is unavailable` 不再被当限流连打 5~6 把凭据**（CMP-129）。该 body 上游用
+  **429 与 403 两种状态码**回同一句话（CMP-86 修的是 403 形态，本次现场是 429 形态），
+  但 429 形态落进「429 一律轮转」的窄判据：每个请求**换 5~6 把凭据连打**
+  （现网实测 k1→k16 逐字同一句），且**不进熔断**，下一发照旧重来一遍。
+  - 抽出 `isEndpointUnavailableUpstream(status, body)` 作**唯一**判定函数，
+    `isRetryableQuotaUpstream` 的 403 分支改为调它 —— CMP-86 的判据表测试原样通过，
+    不复制第二份判断。状态码只认 429/403 两种实测形态；仍只认 message、不认整个
+    `type:"server_error"`（同 type 下 `Model is unavailable` 是模型已下线的永久错误）。
+  - 该形态**先于** `advanceOCKey` 判定：单发只打一次上游、不换 key、不换出口，
+    记一次**按模型熔断**后立即回客户端。熔断复用 CMP-83 的同一张表与阈值
+    （threshold 3 / window 10min / hold ≤15min），只给条目多带 `clientStatus/clientBody`。
+  - **对客户端的形态刻意与真配额可区分**（行为变更，注意）：
+    - 真配额耗尽：**429** + `FreeUsageLimitError` + `Retry-After`（**原样不动**）
+    - 端点不可用：**503** + `EndpointUnavailableError` + **不带** `Retry-After`
+    理由：429 + 空 `Retry-After` 会让客户端当成「立刻可重试」而形成打转；而上游连配额窗口
+    都没给，重发同一请求不会更快成功。熔断期满了自动放行去探活，上游一恢复即自愈。
+  - 前提核验（2026-10-17 现网实测，非推测）：同一把凭据、同一镜像、串行 10 发单变量对照 ——
+    直连腿 200×4 后转本形态；`__round_robin__` over `mihomo:20819` 腿经 mihomo 日志确认
+    落 **10 个不同出口节点**、零 200。⇒ 换出口这条真修法在本形态上不成立。
+  - CMP-86 原先让 403 形态「换出口/换凭据重试到预算用尽」，本卡按同一判定把它并入同一条
+    熔断快速失败路径，两个状态码形态不再走两套行为；相关行为用例已按新行为改写
+    （`TestIsRetryableQuotaUpstream` 判据表未动，原样通过）。
+  - 单测：429 形态不断 key 且回 503、熔断打开后不打上游、403 形态同路径、流式入口同路径、
+    以及「真配额 vs 端点不可用两形态可区分」的对照用例。
+
 - **403 `FreeTierError` 不进自愈重试，单把失效凭据能卡死整机**（CMP-110，根因来自 CMP-109 分诊）。
   CMP-109 现场（2026-10-17 14:12–14:16 CST）：现网五个免费层模型同一时刻**全灭**，
   而容器 `healthy`、`/health=200`。受控金丝雀同窗口交错复现：池里 `k1/k2/k10` 回 200、
@@ -64,12 +89,15 @@
 
 - `TestFreeTierToolsGate` 契约更新：核心五件必须补齐、同名桩替换为真实定义、
   未知名保留（新增 shell 桩替换断言）。
-- `TestIsRetryableQuotaUpstream` / `TestTransient403RetriesThenPassesThrough` /
-  `TestTransient403RetriesStream` / `TestForbiddenNonTransientNotRetried`：钉住
+- `TestIsRetryableQuotaUpstream` / `TestEndpointUnavailable403SamePath` /
+  `TestEndpointUnavailableStreamSamePath` / `TestForbiddenNonTransientNotRetried`：钉住
   403 瞬时类换出口/换凭据重试到预算用尽且透传上游原始 403（非流式与流式两个入口各一条）、
   403 `FreeTierError` 与 400 `Model is unavailable` 都不重试；429 行为由既有
   `TestQuotaClass429StopsAtOneUpstreamCall` / `TestCredential429StillRotates` 回归。
   已做变异验证：摘掉 403 那一臂后前三条用例转红。
+  （CMP-129 起 `TestTransient403RetriesThenPassesThrough` / `TestTransient403RetriesStream`
+  已按新行为改写为同名的 `TestEndpointUnavailable403SamePath` /
+  `TestEndpointUnavailableStreamSamePath`：403 形态不再轮转，改走熔断快速失败回 503。）
 
 ## [v1.0.4] - 2026-10-14
 

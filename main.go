@@ -1407,6 +1407,10 @@ type quotaBreakerEntry struct {
 	firstAt     time.Time
 	openUntil   time.Time
 	retryAfter  string
+	// clientStatus/clientBody 是熔断期回给客户端的东西，由打开熔断的那次命中的
+	// 形态决定：配额耗尽回 429 FreeUsageLimitError，端点不可用回 503 EndpointUnavailableError。
+	clientStatus int
+	clientBody   []byte
 }
 
 var (
@@ -1440,21 +1444,32 @@ func isQuotaClass429(h http.Header, body []byte) bool {
 	return false
 }
 
+// isEndpointUnavailableUpstream 判定「端点/模型级不可用」：只认 message
+// `Endpoint is unavailable`，状态码只认上游实测用过的两种形态（429 与 403）。
+//
+// 同一份 body 上游两种状态码都回过（CMP-46 实测）；2026-10-17 现网复核还是同一句，
+// 只是形态轮到 429（CMP-129）。两个形态共用这一个判定，不要复制第二份判断。
+//
+// 绝不认整个 `type:"server_error"`：同 type 下 `Model is unavailable` 是模型已下线的
+// 永久错误（实测 400），归进来会把一个恢复无望的模型按整段不可用处理。
+func isEndpointUnavailableUpstream(status int, body []byte) bool {
+	if status != http.StatusTooManyRequests && status != http.StatusForbidden {
+		return false
+	}
+	return bytes.Contains(body, []byte("Endpoint is unavailable"))
+}
+
 // isRetryableQuotaUpstream 是「换出口 + 换凭据后值得再试」的窄判据：
 // 429，以及**以 403 形态回来的同一份瞬时上游错误**。
 //
 // 上游把 `Endpoint is unavailable`（server_error）有时回 429、有时回 403，
 // body 逐字相同（CMP-46 实测）。429 形态本来就进重试；403 形态原先直接落透传分支，
 // 既不换出口也不换凭据且零日志 —— 出口抽到持续报错的节点时会**永久卡死**。
-//
-// 判据必须只认 message `Endpoint is unavailable`，绝不能认整个 `type:"server_error"`：
-// 同一个 type 下还有 `Model is unavailable`（模型已下线，实质永久错误，实测回 400），
-// 拖进重试只会白烧凭据与出口、把首字节延迟拉到分钟级。400 本轮不纳入。
 func isRetryableQuotaUpstream(status int, body []byte) bool {
 	if status == http.StatusTooManyRequests {
 		return true
 	}
-	return status == http.StatusForbidden && bytes.Contains(body, []byte("Endpoint is unavailable"))
+	return isEndpointUnavailableUpstream(status, body)
 }
 
 // isFreeTier403 判定「凭据级」的 403 FreeTierError。
@@ -1471,24 +1486,34 @@ func isFreeTier403(status int, body []byte) bool {
 	return status == http.StatusForbidden && bytes.Contains(body, []byte("FreeTierError"))
 }
 
-// quotaBreakerBlocked 熔断期内返回缓存的 Retry-After 与 true。
+// quotaBreakerBlocked 熔断期内返回要回给客户端的状态码/body 与缓存的 Retry-After。
 // 熔断期满即删除条目，让下一发真实探一次上游。
-func quotaBreakerBlocked(model string) (string, bool) {
+func quotaBreakerBlocked(model string) (int, []byte, string, bool) {
 	quotaBreakerMu.Lock()
 	defer quotaBreakerMu.Unlock()
 	e := quotaBreakers[model]
 	if e == nil || e.openUntil.IsZero() {
-		return "", false
+		return 0, nil, "", false
 	}
 	if time.Now().After(e.openUntil) {
 		delete(quotaBreakers, model)
-		return "", false
+		return 0, nil, "", false
 	}
-	return e.retryAfter, true
+	return e.clientStatus, e.clientBody, e.retryAfter, true
 }
 
 // noteQuotaExhausted 记一次配额 429；同模型在窗口内连撞到阈值即打开熔断。
 func noteQuotaExhausted(model, retryAfter string) {
+	noteBreakerHit(model, retryAfter, http.StatusTooManyRequests, quotaExhaustedBody())
+}
+
+// noteEndpointUnavailable 记一次「端点/模型级不可用」。计数与保持时间复用 CMP-83 的
+// 按模型熔断（同一个 map、同一套阈值），只有回给客户端的东西不同。
+func noteEndpointUnavailable(model string) {
+	noteBreakerHit(model, "", http.StatusServiceUnavailable, endpointUnavailableBody())
+}
+
+func noteBreakerHit(model, retryAfter string, clientStatus int, clientBody []byte) {
 	now := time.Now()
 	quotaBreakerMu.Lock()
 	defer quotaBreakerMu.Unlock()
@@ -1499,6 +1524,8 @@ func noteQuotaExhausted(model, retryAfter string) {
 	}
 	e.consecutive++
 	e.retryAfter = retryAfter
+	e.clientStatus = clientStatus
+	e.clientBody = clientBody
 	if e.consecutive < quotaBreakerThreshold {
 		return
 	}
@@ -1525,6 +1552,14 @@ func noteUpstreamOK(model string) {
 // 一致，免得客户端按两套错误结构分支。
 func quotaExhaustedBody() []byte {
 	return []byte(`{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded. Please try again later."}}`)
+}
+
+// endpointUnavailableBody 「端点/模型级不可用」回给客户端的 body，刻意与配额耗尽
+// 不同形态：配额是 429 + FreeUsageLimitError + Retry-After（客户端按配额退避），
+// 这里是 503 且不带 Retry-After（上游连配额窗口都没给，重发同一请求不会更快成功）。
+// 429 + 空 Retry-After 会让客户端立刻重试形成打转，这是本形态必须单独成型的理由。
+func endpointUnavailableBody() []byte {
+	return []byte(`{"type":"error","error":{"type":"EndpointUnavailableError","message":"Upstream endpoint is unavailable for this model. This is not a rate limit; retrying now will not succeed sooner."}}`)
 }
 
 // quotaExhaustedHeaders 熔断快速失败时的响应头，带上最后一次观测到的 Retry-After。
@@ -2973,11 +3008,11 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 	if extra := keyPoolExtraAttempts(); extra > 0 && attempts < extra+1 {
 		attempts = extra + 1
 	}
-	// 该模型额度已被打光时连上游都不打：轮转与换出口对配额类 429 无效，
+	// 该模型额度已被打光（或整段不可用）时连上游都不打：轮转与换出口对这两类都无效，
 	// 每发白烧凭据与出口，首字节延迟从 ~1s 拉到 8–22s（CMP-48 §3 判据 3 实测）。
-	if ra, blocked := quotaBreakerBlocked(modelID); blocked {
-		log.Printf("%s[quota breaker open] model=%s retry_after=%q 跳过上游直接回 429", labelPrefix(ctx), modelID, ra)
-		return quotaExhaustedBody(), http.StatusTooManyRequests, quotaExhaustedHeaders(ra), fmt.Errorf("upstream quota exhausted")
+	if st, b, ra, blocked := quotaBreakerBlocked(modelID); blocked {
+		log.Printf("%s[quota breaker open] model=%s status=%d 跳过上游直接回 %d", labelPrefix(ctx), modelID, st, st)
+		return b, st, quotaExhaustedHeaders(ra), fmt.Errorf("upstream breaker open")
 	}
 	// 这个循环只服务两类重试：429 换出口/换凭据重试、Tor 电路故障 / 网络层错误重试。
 	// 5xx 已不再重试 —— 直接走下面的透传分支，把上游状态码与错误体原样交给客户端。
@@ -3023,13 +3058,21 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		// 429 与「403 + Endpoint is unavailable」是同一类瞬时上游错误的两种状态码形态（CMP-46），
-		// 两种都要换出口/换凭据再试。配额语义只有 429 有：403 形态不是额度耗尽，永远换 key。
-		// 403 FreeTierError 是第三种：上游按凭据回的门（CMP-109），换 key 能自救。
+		// 三类上游信号各走各的路：配额类（429 + FreeUsageLimitError）单发只打一次并进熔断；
+		// 「端点/模型级不可用」（429 或 403 + Endpoint is unavailable）同样不轮转、进熔断；
+		// 403 FreeTierError 是凭据级门（CMP-109），换 key 能自救，继续轮转。
 		freeTier403 := isFreeTier403(resp.StatusCode, errBody)
 		if freeTier403 || isRetryableQuotaUpstream(resp.StatusCode, errBody) {
 			retryAfter := resp.Header.Get("Retry-After")
 			quota := resp.StatusCode == http.StatusTooManyRequests && isQuotaClass429(resp.Header, errBody)
+			// 「端点/模型级不可用」不是限流，轮转纯属白烧：现网同一时刻 k1→k16 逐字同一句
+			// （CMP-129），同一把 key 在 10 个不同 OC 节点上也零救回（单变量对照实测）。
+			// 直接记一次按模型熔断并回 503 —— 熔断期满了自动放行去探活，上游一恢复即自愈。
+			if !quota && isEndpointUnavailableUpstream(resp.StatusCode, errBody) {
+				noteEndpointUnavailable(modelID)
+				log.Printf("%s[endpoint unavailable] model=%s key_id=%s exit=%s status=%d 不换 key/出口，记熔断并回 503 body=%s", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode, string(errBody))
+				return endpointUnavailableBody(), http.StatusServiceUnavailable, quotaExhaustedHeaders(""), fmt.Errorf("upstream endpoint unavailable")
+			}
 			nextKey := ""
 			if !quota {
 				nextKey = advanceOCKey(ocCurrentSessionID())
@@ -3096,10 +3139,10 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 	if extra := keyPoolExtraAttempts(); extra > 0 && attempts < extra+1 {
 		attempts = extra + 1
 	}
-	// 同 callOpenCodeAPI：该模型额度打光后连上游都不打。
-	if ra, blocked := quotaBreakerBlocked(modelID); blocked {
-		log.Printf("%s[quota breaker open] model=%s retry_after=%q 跳过上游直接回 429", labelPrefix(ctx), modelID, ra)
-		return io.NopCloser(bytes.NewReader(quotaExhaustedBody())), http.StatusTooManyRequests, quotaExhaustedHeaders(ra), nil
+	// 同 callOpenCodeAPI：该模型额度打光（或整段不可用）后连上游都不打。
+	if st, b, ra, blocked := quotaBreakerBlocked(modelID); blocked {
+		log.Printf("%s[quota breaker open] model=%s status=%d 跳过上游直接回 %d", labelPrefix(ctx), modelID, st, st)
+		return io.NopCloser(bytes.NewReader(b)), st, quotaExhaustedHeaders(ra), nil
 	}
 	// 这个循环只服务两类重试：429 换出口/换凭据重试、Tor 电路故障 / 网络层错误重试。
 	// 5xx 已不再重试 —— 直接走下面的透传分支，把上游状态码与错误体原样交给客户端。
@@ -3131,12 +3174,18 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		// 与 callOpenCodeAPI 同源：429 与「403 + Endpoint is unavailable」都换出口/换凭据再试，
+		// 与 callOpenCodeAPI 同源：配额类与「端点/模型级不可用」都单发只打一次并进熔断，
 		// 「403 + FreeTierError」只换凭据（见 isFreeTier403）。
 		freeTier403 := isFreeTier403(resp.StatusCode, errBody)
 		if freeTier403 || isRetryableQuotaUpstream(resp.StatusCode, errBody) {
 			retryAfter := resp.Header.Get("Retry-After")
 			quota := resp.StatusCode == http.StatusTooManyRequests && isQuotaClass429(resp.Header, errBody)
+			// 与 callOpenCodeAPI 同源：端点/模型级不可用不换 key/出口，记熔断后回 503。
+			if !quota && isEndpointUnavailableUpstream(resp.StatusCode, errBody) {
+				noteEndpointUnavailable(modelID)
+				log.Printf("%s[endpoint unavailable] model=%s key_id=%s exit=%s status=%d 不换 key/出口，记熔断并回 503 body=%s", labelPrefix(ctx), modelID, keyID, selection.Label, resp.StatusCode, string(errBody))
+				return io.NopCloser(bytes.NewReader(endpointUnavailableBody())), http.StatusServiceUnavailable, quotaExhaustedHeaders(""), nil
+			}
 			nextKey := ""
 			if !quota {
 				nextKey = advanceOCKey(ocCurrentSessionID())
@@ -6003,6 +6052,8 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:14
 body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%;background:radial-gradient(ellipse at 30% 20%,var(--glow-a) 0%,transparent 50%),radial-gradient(ellipse at 70% 80%,var(--glow-b) 0%,transparent 50%);pointer-events:none;z-index:0}
 .container{max-width:1020px;margin:0 auto;padding:32px 24px;position:relative;z-index:1}
 header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid var(--border);justify-content:space-between}
+.head-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.head-btn{font-size:13px;padding:7px 11px;white-space:nowrap}
 .logo{display:flex;align-items:center;gap:10px}
 .logo-mark{width:36px;height:36px;background:linear-gradient(135deg,var(--accent),#8b6cff);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;color:#fff;flex-shrink:0}
 .logo-text{font-size:22px;font-weight:700;letter-spacing:-.5px;background:linear-gradient(135deg,var(--text),var(--text-sec));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
@@ -6012,12 +6063,13 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 .card h2{font-size:13px;font-weight:600;margin-bottom:16px;letter-spacing:.2px;display:flex;align-items:center;gap:8px;color:var(--text-sec);text-transform:uppercase}
 .card h2 .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 .config-grid{display:grid;grid-template-columns:2fr 3fr;gap:16px;margin-top:16px}
+.config-grid>*{min-width:0}
 .config-grid .card{margin-bottom:0}
 .full-row{grid-column:1/-1}
 .form-group{margin-bottom:14px}
 .form-group:last-child{margin-bottom:0}
 .form-group label{display:block;font-size:11.5px;font-weight:500;color:var(--text-ter);margin-bottom:5px;letter-spacing:.4px;text-transform:uppercase}
-.form-group input[type="text"],.form-group input[type="url"],.form-group input[type="password"],.form-group textarea,.form-group select,.m-select{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--mono);background:var(--surface-2);color:var(--text);transition:border-color .15s,box-shadow .15s}
+.form-group input[type="text"],.form-group input[type="url"],.form-group input[type="password"],.form-group textarea,.form-group select,.m-select,.m-input{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--mono);background:var(--surface-2);color:var(--text);transition:border-color .15s,box-shadow .15s}
 .form-group input:focus,.form-group textarea:focus,.form-group select:focus,.m-select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}
 .form-group .hint{font-size:11px;color:var(--text-ter);margin-top:4px;line-height:1.4}
 .actions{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
@@ -6032,6 +6084,8 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 .btn-warning:hover{background:var(--orange);color:#fff}
 .btn-danger{background:var(--red-dim);color:var(--red)}
 .btn-danger:hover{background:var(--red);color:#fff}
+.tbl-wrap{margin-bottom:12px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+#statsContent{overflow-x:auto;-webkit-overflow-scrolling:touch}
 .tbl{width:100%;border-collapse:collapse;font-size:12.5px}
 .tbl th{text-align:left;font-weight:500;color:var(--text-ter);padding:8px 10px;border-bottom:1px solid var(--border);font-size:11px;letter-spacing:.4px;text-transform:uppercase;white-space:nowrap}
 .tbl td{padding:7px 10px;border-bottom:1px solid var(--border)}
@@ -6061,7 +6115,6 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 #toast.error{background:rgba(240,96,96,.85)}
 #toast.show{opacity:1;transform:translateY(0)}
 .empty-hint{color:var(--text-ter);font-size:13px;padding:28px;text-align:center}
-@media(max-width:700px){.config-grid{grid-template-columns:1fr}.container{padding:16px 12px}header{flex-direction:column;align-items:flex-start;gap:8px}.effort-label-row,.effort-row{grid-template-columns:minmax(90px,1fr) 22px minmax(90px,1fr) auto}}
 .theme-toggle{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 12px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;transition:all .15s;color:var(--text-sec);flex-shrink:0;line-height:1}
 .theme-toggle:hover{border-color:var(--border-light);color:var(--text)}
 .panel-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:16px}
@@ -6086,6 +6139,21 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 .effort-row .btn{padding:6px 10px;font-size:11px}
 .effort-empty{padding:16px 8px;color:var(--text-ter);font-size:12px;text-align:center;border:1px dashed var(--border);border-radius:6px}
 .effort-actions{margin-top:10px}
+.ver-chip{display:flex;align-items:center;gap:8px;padding:6px 12px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;color:var(--text-sec);white-space:nowrap;flex-shrink:0}
+.ver-chip b{font-family:var(--mono);font-weight:600;color:var(--text)}
+.ver-chip a{color:var(--orange);font-weight:500;text-decoration:none}
+.ver-chip a:hover{text-decoration:underline}
+.ver-chip .up{color:var(--orange);font-weight:600}
+.ver-chip .ok{color:var(--green);font-weight:500}
+.ver-chip .fail{color:var(--text-ter)}
+/* —— 手机视口适配（放最后：同特异度下靠后的规则才压得住上面那些基础规则）——
+   竖屏走 ≤700px（实测 OPPO PKG110 = 361px CSS 宽）；横屏宽 794px 过了宽度断点、
+   但可视高度只剩 ~397px，故并入 max-height:520px 一档，否则横屏退回桌面字号与触控尺寸 */
+@media(max-width:700px),(max-height:520px) and (orientation:landscape){.config-grid{grid-template-columns:1fr}.container{padding:16px 12px}header{flex-direction:column;align-items:flex-start;gap:8px}.head-actions{width:100%}.ver-chip{flex:0 0 100%;white-space:normal;flex-wrap:wrap}.effort-label-row,.effort-row{grid-template-columns:minmax(90px,1fr) 22px minmax(90px,1fr) auto}.stats-header .btns,.panel-header .btns{flex-wrap:wrap}#toast{left:12px;right:12px;top:12px}}
+/* 字号下限 14px；输入框 16px（低于 16 时 iOS/部分安卓浏览器聚焦会自动放大页面）；可点控件 ≥44px */
+@media(max-width:700px),(max-height:520px) and (orientation:landscape){.tbl th,.tbl td,.form-group label,.form-group .hint,.effort-label-row,.advanced-settings summary,.advanced-hint,.advanced-summary-count,.empty-hint,.ver-chip{font-size:14px}.form-group input,.form-group textarea,.form-group select,.m-select,.m-input,.tbl input,.tbl .m-select,.effort-row input{font-size:16px;min-height:44px}.btn,.tbl .btn,.effort-row .btn,.theme-toggle,.head-btn,.advanced-settings summary{min-height:44px}.btn,.tbl .btn,.effort-row .btn,.head-btn{font-size:14px;padding:10px 14px}.tbl input,.tbl select,.tbl .m-select{min-width:120px}#statsTable td:first-child,#dailyTable td:first-child{min-width:110px}}
+/* 横屏专属：压扁页头。竖屏那条两行页头留在 ~397px 高的屏上会吃掉小半屏 */
+@media(max-height:520px) and (orientation:landscape){header{flex-direction:row;align-items:center;gap:8px;margin-bottom:14px;padding-bottom:10px}.head-actions{width:auto;flex-wrap:nowrap;gap:6px;justify-content:flex-end}.ver-chip{flex:0 1 auto;min-width:0;max-width:230px}.logo-text{font-size:15px;white-space:nowrap}.logo-sub{display:none}.container{padding:12px 16px}#toast{top:8px;right:8px}}
 </style>
 </head>
 <body>
@@ -6098,9 +6166,11 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 <div class="logo-sub">OpenCode 免费 API → 兼容格式代理</div>
 </div>
 </div>
-<div style="display:flex;align-items:center;gap:8px">
+<div class="head-actions">
+<span class="ver-chip"><b id="verCur" title="当前版本">…</b><span id="verStatus"></span></span>
+<button class="theme-toggle head-btn" id="verCheckBtn" onclick="checkUpdate()" title="检查更新">检查更新</button>
 <button class="theme-toggle" onclick="toggleTheme()" title="切换主题">☀</button>
-<form method="post" action="/logout" style="margin:0"><button class="theme-toggle" type="submit" title="退出登录" style="font-size:14px">退出</button></form>
+<form method="post" action="/logout" style="margin:0"><button class="theme-toggle head-btn" type="submit" title="退出登录">退出</button></form>
 </div>
 </header>
 
@@ -6127,7 +6197,7 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 <button class="btn btn-success" onclick="saveConfig()">保存全部</button>
 </div>
 </div>
-<div style="margin-bottom:12px">
+<div class="tbl-wrap">
 <table class="tbl" id="aliasTable">
 <thead><tr><th style="width:22%">别名（请求名）</th><th style="width:28%">实际模型（无图）</th><th style="width:28%">多模态模型（带图）</th><th style="width:22%"></th></tr></thead>
 <tbody></tbody>
@@ -6146,7 +6216,7 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 
 <div class="card full-row">
 <h2><span class="dot" style="background:var(--accent)"></span>SOCKS5 代理</h2>
-<div style="margin-bottom:12px">
+<div class="tbl-wrap">
 <table class="tbl" id="socks5Table">
 <thead><tr><th style="width:25%">名称</th><th style="width:28%">地址</th><th style="width:17%">用户名</th><th style="width:17%">密码</th><th style="width:13%"></th></tr></thead>
 <tbody></tbody>
@@ -6202,8 +6272,11 @@ async function saveConfig(){collectAliases();collectEfforts();collectSocks5();co
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
 async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await fetch('/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}
-async function loadStats(){try{const r=await fetch('/api/stats');const d=await r.json();const ms=d.models||{};const ks=Object.keys(ms);const dm=d.daily?d.daily.models||{}:{};const dk=Object.keys(dm);let h='';if(d.daily&&d.daily.date){h+='<div style="margin-bottom:16px;padding:10px 14px;background:var(--accent);color:#fff;border-radius:8px;font-size:13px">📊 今日统计 ('+esc(d.daily.date)+')：请求 '+fmt(d.daily.total_requests)+' 次</div>'}if(dk.length>0){h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">今日模型用量</h3><table class="tbl" id="dailyTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';let dr=0,dp=0,dc=0,dt=0;for(const k of dk){const m=dm[k];if(!m)continue;h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';dr+=m.request_count;dp+=m.prompt_tokens;dc+=m.completion_tokens;dt+=m.total_tokens}h+='<tr style="font-weight:600"><td>今日合计</td><td>'+fmt(dr)+'</td><td>'+fmt(dp)+'</td><td>'+fmt(dc)+'</td><td>'+fmt(dt)+'</td></tr>';h+='</tbody></table><hr style="border:none;border-top:1px solid var(--border);margin:20px 0">'}h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">累计统计</h3><table class="tbl" id="statsTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';if(!ks.length){h+='<tr><td colspan="5" class="empty-hint">暂无数据</td></tr>'}else{let tr=0,pt=0,ct=0,tt=0;for(const k of ks){const m=ms[k];h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';tr+=m.request_count;pt+=m.prompt_tokens;ct+=m.completion_tokens;tt+=m.total_tokens}h+='<tr style="font-weight:600"><td>累计总计</td><td>'+fmt(tr)+'</td><td>'+fmt(pt)+'</td><td>'+fmt(ct)+'</td><td>'+fmt(tt)+'</td></tr>'}h+='</tbody></table>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}
-function fmt(n){return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g,',')}window.onload=function(){loadConfig();loadStats()};setInterval(loadStats,5000);document.addEventListener('visibilitychange',function(){if(!document.hidden){loadStats()}});
+async function loadStats(){try{const r=await fetch('/api/stats');const d=await r.json();const ms=d.models||{};const ks=Object.keys(ms);const dm=d.daily?d.daily.models||{}:{};const dk=Object.keys(dm);let h='';if(d.daily&&d.daily.date){h+='<div style="margin-bottom:16px;padding:10px 14px;background:var(--accent);color:#fff;border-radius:8px;font-size:14px">📊 今日统计 ('+esc(d.daily.date)+')：请求 '+fmt(d.daily.total_requests)+' 次</div>'}if(dk.length>0){h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">今日模型用量</h3><table class="tbl" id="dailyTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';let dr=0,dp=0,dc=0,dt=0;for(const k of dk){const m=dm[k];if(!m)continue;h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';dr+=m.request_count;dp+=m.prompt_tokens;dc+=m.completion_tokens;dt+=m.total_tokens}h+='<tr style="font-weight:600"><td>今日合计</td><td>'+fmt(dr)+'</td><td>'+fmt(dp)+'</td><td>'+fmt(dc)+'</td><td>'+fmt(dt)+'</td></tr>';h+='</tbody></table><hr style="border:none;border-top:1px solid var(--border);margin:20px 0">'}h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">累计统计</h3><table class="tbl" id="statsTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';if(!ks.length){h+='<tr><td colspan="5" class="empty-hint">暂无数据</td></tr>'}else{let tr=0,pt=0,ct=0,tt=0;for(const k of ks){const m=ms[k];h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';tr+=m.request_count;pt+=m.prompt_tokens;ct+=m.completion_tokens;tt+=m.total_tokens}h+='<tr style="font-weight:600"><td>累计总计</td><td>'+fmt(tr)+'</td><td>'+fmt(pt)+'</td><td>'+fmt(ct)+'</td><td>'+fmt(tt)+'</td></tr>'}h+='</tbody></table>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}
+let verBusy=false;
+function renderVersion(d){const cur=document.getElementById('verCur'),st=document.getElementById('verStatus');const v=d.version||'dev';cur.textContent=v;cur.title=v==='dev'?'本地构建，未注入版本号':'当前版本 '+v;st.textContent='';st.className='';if(d.error){st.textContent='检查失败';st.className='fail';return}if(d.has_update){st.className='up';st.textContent='有新版本 '+d.latest+' ';const a=document.createElement('a');a.href=d.release_url||'https://github.com/callacat/opencode2api-lite/releases/latest';a.target='_blank';a.rel='noopener';a.textContent='查看';st.appendChild(a);return}if(v==='dev'){st.textContent='未注入版本';st.className='fail';return}st.textContent='已是最新';st.className='ok'}
+async function checkUpdate(silent){if(verBusy)return;verBusy=true;const b=document.getElementById('verCheckBtn'),label=b.textContent;b.disabled=true;b.textContent='检查中…';try{const r=await fetch('/api/version');const d=await r.json();renderVersion(d);if(silent)return;if(d.error)showToast('检查更新失败','error');else if(d.has_update)showToast('发现新版本 '+d.latest,'error');else showToast('已是最新','success')}catch(e){const st=document.getElementById('verStatus');st.textContent='检查失败';st.className='fail';if(!silent)showToast('检查更新失败','error')}finally{b.disabled=false;b.textContent=label;verBusy=false}}
+function fmt(n){return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g,',')}window.onload=function(){loadConfig();loadStats();checkUpdate(true)};setInterval(loadStats,5000);document.addEventListener('visibilitychange',function(){if(!document.hidden){loadStats()}});
 </script>
 </body>
 </html>`
@@ -6227,6 +6300,129 @@ func initializeOpenCode() {
 // version 由构建时注入（-ldflags "-X main.version=..."，取 release tag），
 // 未注入时（本地 go build）为 dev。版本单一来源 = git tag。
 var version = "dev"
+
+// ======================== 版本自检 ========================
+
+const releaseRepo = "callacat/opencode2api-lite"
+
+// releaseCheckTTL 是 GitHub 查询结果（成功与失败同用）的缓存时长。
+// api.github.com 未认证限 60 次/小时/IP，面板每开一次都打一次会很快打满，
+// 故成功和失败都缓存：最坏 2 次/小时。
+var releaseCheckTTL = 30 * time.Minute
+
+type latestRelease struct {
+	Tag string `json:"tag_name"`
+	URL string `json:"html_url"`
+}
+
+// fetchLatestRelease 是真正出站的那一步，测试里替换掉即可离线验证缓存行为。
+var fetchLatestRelease = func(ctx context.Context) (latestRelease, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"https://api.github.com/repos/"+releaseRepo+"/releases/latest", nil)
+	if err != nil {
+		return latestRelease{}, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	client, _, err := getHTTPClient(ctx)
+	if err != nil {
+		return latestRelease{}, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return latestRelease{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return latestRelease{}, fmt.Errorf("github 返回 %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return latestRelease{}, err
+	}
+	var rel latestRelease
+	if err := json.Unmarshal(body, &rel); err != nil {
+		return latestRelease{}, err
+	}
+	if rel.Tag == "" {
+		return latestRelease{}, errors.New("github 响应缺少 tag_name")
+	}
+	return rel, nil
+}
+
+var (
+	releaseMu     sync.Mutex
+	releaseCache  latestRelease
+	releaseCached bool
+	releaseAt     time.Time
+	releaseErr    error
+)
+
+func cachedLatestRelease(ctx context.Context) (latestRelease, time.Time, error) {
+	releaseMu.Lock()
+	defer releaseMu.Unlock()
+	if releaseCached && time.Since(releaseAt) < releaseCheckTTL {
+		return releaseCache, releaseAt, releaseErr
+	}
+	rel, err := fetchLatestRelease(ctx)
+	releaseAt, releaseErr = time.Now(), err
+	if err == nil {
+		releaseCache = rel
+		log.Printf("检查更新: GitHub releases/latest = %s", rel.Tag)
+	} else {
+		log.Printf("检查更新: 查询 GitHub 失败（%v），%s 内不再重试", err, releaseCheckTTL)
+	}
+	releaseCached = true
+	return releaseCache, releaseAt, err
+}
+
+// hasNewerVersion 判断 latest 是否比 current 新。
+// 两侧都先去掉 tag 前缀 "v"：versionNumbers 逐段只吃数字字符，
+// "v1.0.4" 首段非数字即 break 会被解析成 [0,0,4]，与 "1.0.4" = [1,0,4] 不等，
+// 不归一化会把同版本误报成「有更新」。
+func hasNewerVersion(current, latest string) bool {
+	current = strings.TrimPrefix(strings.TrimSpace(current), "v")
+	latest = strings.TrimPrefix(strings.TrimSpace(latest), "v")
+	if current == "" || latest == "" || current == "dev" {
+		return false
+	}
+	return compareVersion(latest, current) > 0
+}
+
+type versionStatus struct {
+	Version    string `json:"version"`
+	Latest     string `json:"latest,omitempty"`
+	HasUpdate  bool   `json:"has_update"`
+	ReleaseURL string `json:"release_url,omitempty"`
+	CheckedAt  string `json:"checked_at,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+func checkLatestVersion(ctx context.Context) versionStatus {
+	st := versionStatus{Version: strings.TrimSpace(version)}
+	rel, at, err := cachedLatestRelease(ctx)
+	if err != nil {
+		st.Error = "检查失败"
+		return st
+	}
+	st.Latest = rel.Tag
+	st.ReleaseURL = rel.URL
+	st.CheckedAt = at.UTC().Format(time.RFC3339)
+	st.HasUpdate = hasNewerVersion(st.Version, rel.Tag)
+	return st
+}
+
+// adminVersionHandler 供面板显示当前版本与是否有新版本。
+// 出站失败一律降级为 error 字段，不阻塞、不影响其它端点。
+func adminVersionHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(checkLatestVersion(r.Context()))
+}
 
 func main() {
 	flag.StringVar(&port, "port", "8000", "服务端口")
@@ -6275,6 +6471,7 @@ func main() {
 	http.HandleFunc("/api/stats", requireAuth(adminStatsHandler))
 	http.HandleFunc("/api/reload", requireAuth(reloadHandler))
 	http.HandleFunc("/api/models", requireAuth(adminModelsHandler))
+	http.HandleFunc("/api/version", requireAuth(adminVersionHandler))
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
