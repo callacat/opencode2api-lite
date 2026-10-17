@@ -6,6 +6,21 @@
 
 ### 修复
 
+- **403 `FreeTierError` 不进自愈重试，单把失效凭据能卡死整机**（CMP-110，根因来自 CMP-109 分诊）。
+  CMP-109 现场（2026-10-17 14:12–14:16 CST）：现网五个免费层模型同一时刻**全灭**，
+  而容器 `healthy`、`/health=200`。受控金丝雀同窗口交错复现：池里 `k1/k2/k10` 回 200、
+  `k43/k86` 稳定回 403 `FreeTierError`；「会话新鲜度」与「出口」两条假设各被单变量实验证伪。
+  ⇒ 上游按**凭据**回这道门。原实现只在 `429` 时轮换凭据，403 落透传分支 —— 粘滞 key
+  一旦撞上失效集合就整机 403，池中 80+ 把可用凭据全部闲置，且**不自愈**。
+  - 新增窄判据 `isFreeTier403`：`403 && body 含 "FreeTierError"`，与 CMP-86 的
+    `isRetryableQuotaUpstream`（429 / 403+`Endpoint is unavailable`）并列，两个入口
+    （`callOpenCodeAPI` / `callOpenCodeAPIStream`）都纳入重试，预算沿用现有
+    `socks5RateLimitAttemptCount()` + `keyPoolExtraAttempts()`，不引入无界重试。
+  - **只换 key，不跟换出口/换会话**：那两条已被 CMP-109 实验 2/3 证伪，跟着换只会白烧额度。
+  - 不宽成整个 `type:"server_error"`：同 type 下 `Model is unavailable` 是模型已下线的
+    永久错误（实测 400），拖进重试同样白烧。试满后仍把**上游原始 403 + body** 透传。
+  - 可观测性：`[free tier rejected]` 行补 `key_id=`（与 429 行对齐）—— 此前这道 403
+    不带 key，排查时无法分辨「粘滞 key 撞上失效集合」与「门整体失效」。
 - **403 形态的瞬时上游错误不进自愈重试，且零日志**（CMP-86，缺口来自 CMP-46 定位）。
   上游把 `Endpoint is unavailable`（`type:"server_error"`）有时回 429、有时回 403，
   body 逐字相同。429 形态本来就换出口/换凭据重试；403 形态却直接落透传分支 ——

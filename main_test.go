@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -818,7 +819,7 @@ func TestIsRetryableQuotaUpstream(t *testing.T) {
 	}{
 		{"429 一律重试", 429, `{"error":{"message":"slow down"}}`, true},
 		{"403 + Endpoint is unavailable（瞬时）", 403, transientBody, true},
-		{"403 + FreeTierError（会话门，重试无意义）", 403, quotaTestBody, false},
+		{"403 + FreeUsageLimitError（不是瞬时类；配额语义只认 429）", 403, quotaTestBody, false},
 		{"403 + 其他 body", 403, `{"error":{"message":"forbidden"}}`, false},
 		{"400 + Model is unavailable（模型已下线，永久错误）", 400, modelGoneBody, false},
 		{"200 正常响应", 200, `{"ok":true}`, false},
@@ -878,8 +879,10 @@ func TestTransient403RetriesStream(t *testing.T) {
 	}
 }
 
-// TestForbiddenNonTransientNotRetried：403 里只认 `Endpoint is unavailable`。
-// FreeTierError（会话门）与 `Model is unavailable`（模型已下线）都是重试无意义的硬失败。
+// TestForbiddenNonTransientNotRetried：403 里只认 `Endpoint is unavailable`，
+// `Model is unavailable`（模型已下线）重试无意义。
+// 注：`403 FreeTierError` 原在此列，CMP-110 依据 CMP-109 的受控实验改判为凭据级门，
+// 已移到下面的「凭据级 403 FreeTierError」一节。
 func TestForbiddenNonTransientNotRetried(t *testing.T) {
 	quotaCase(t)
 	cases := []struct {
@@ -887,7 +890,6 @@ func TestForbiddenNonTransientNotRetried(t *testing.T) {
 		status int
 		body   string
 	}{
-		{"403 FreeTierError（会话门）", http.StatusForbidden, `{"error":{"type":"FreeTierError","message":"free tier"}}`},
 		{"400 Model is unavailable（模型已下线）", http.StatusBadRequest, modelGoneBody},
 	}
 	for _, c := range cases {
@@ -906,3 +908,131 @@ func TestForbiddenNonTransientNotRetried(t *testing.T) {
 		}
 	}
 }
+
+// ======================== 凭据级 403 FreeTierError（CMP-110） ========================
+//
+// CMP-109 现场（2026-10-17 14:12–14:16 CST）：现网五个免费层模型同一时刻全灭，
+// 而容器 healthy、/health=200。受控金丝雀同窗口交错复现：池里 k1/k2/k10 回 200、
+// k43/k86 稳定回 403 FreeTierError；会话新鲜度与出口两条假设各被单变量实验证伪。
+// ⇒ 上游按**凭据**回这道门。原实现只认 429，403 落透传分支 —— 粘滞 key 撞上失效
+// 集合就整机 403，池中其余凭据全闲置且不自愈。
+// 下面钉住三件事：换 key 后能救回、预算用尽仍透传上游原始响应、429 配额路径不回归
+// （配额 429 的回归在上一节 TestQuotaClass429StopsAtOneUpstreamCall）。
+
+const freeTier403Body = `{"error":{"type":"FreeTierError","message":"OpenCode's free tier can only be used with the official client."}}`
+
+const okSSE = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"x\"," +
+	"\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"pong\"},\"finish_reason\":null}]}\n\n" +
+	"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"x\"," +
+	"\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]," +
+	"\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n" +
+	"data: [DONE]\n\n"
+
+func TestIsFreeTier403(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{"403 + FreeTierError", 403, freeTier403Body, true},
+		{"403 + Endpoint is unavailable（瞬时类，走另一条路）", 403, transientBody, false},
+		{"403 + 其他 body", 403, `{"error":{"message":"forbidden"}}`, false},
+		{"429 + FreeUsageLimitError（配额类）", 429, quotaTestBody, false},
+		{"400 + Model is unavailable（永久错误）", 400, modelGoneBody, false},
+	}
+	for _, c := range cases {
+		if got := isFreeTier403(c.status, []byte(c.body)); got != c.want {
+			t.Errorf("%s：期望 %v，得到 %v", c.name, c.want, got)
+		}
+	}
+}
+
+func writeFreeTier403(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	w.Write([]byte(freeTier403Body))
+}
+
+// TestFreeTier403RotatesKeyThenSucceeds 是本卡的核心用例：失效 key 打头时，
+// 第二发必须**换到另一把凭据**并且请求最终成功 —— 这正是 CMP-109 现场缺的自愈。
+func TestFreeTier403RotatesKeyThenSucceeds(t *testing.T) {
+	quotaCase(t)
+	var mu sync.Mutex
+	var auths []string
+	hits, restore := fakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auths = append(auths, r.Header.Get("Authorization"))
+		n := len(auths)
+		mu.Unlock()
+		if n == 1 {
+			writeFreeTier403(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte(okSSE))
+	})
+	defer restore()
+
+	body, status, _, err := callOpenCodeAPI(context.Background(),
+		map[string]any{"model": "space-bunny-free", "stream": true}, "space-bunny-free")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("换 key 后应成功，得到 status=%d err=%v body=%s", status, err, body)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("应以第 2 发成功，实际打了 %d 次上游", got)
+	}
+	if len(auths) != 2 || auths[0] == auths[1] {
+		t.Fatalf("第二发必须换到另一把凭据，实际 Authorization=%v", auths)
+	}
+	if !strings.Contains(string(body), "pong") {
+		t.Fatalf("应还原出上游内容，得到 %s", body)
+	}
+}
+
+// TestFreeTier403RetriesStream：判据在流式入口同样生效（两处是各自独立的循环）。
+func TestFreeTier403RetriesStream(t *testing.T) {
+	quotaCase(t)
+	hits, restore := fakeUpstream(t, writeFreeTier403)
+	defer restore()
+
+	rc, status, _, _ := callOpenCodeAPIStream(context.Background(),
+		map[string]any{"model": "space-bunny-free"}, "space-bunny-free")
+	defer rc.Close()
+	if got := hits.Load(); got != int64(keyPoolDefaultRetries+1) {
+		t.Fatalf("流式入口的 403 FreeTierError 也应换 key 重试到预算用尽（%d 次上游），实际 %d 次",
+			keyPoolDefaultRetries+1, got)
+	}
+	if status != http.StatusForbidden {
+		t.Fatalf("流式入口试满后应透传上游原始 403，得到 %d", status)
+	}
+	b, _ := io.ReadAll(rc)
+	if !strings.Contains(string(b), "FreeTierError") {
+		t.Fatalf("流式入口应透传上游原始错误体，得到 %s", b)
+	}
+}
+
+// TestFreeTier403PassesThroughWhenBudgetExhausted：池里全是失效凭据时，
+// 试满重试预算后仍把**上游原始 403 + body** 透传（不得改写成 502、不得无限重试）。
+func TestFreeTier403PassesThroughWhenBudgetExhausted(t *testing.T) {
+	quotaCase(t)
+	hits, restore := fakeUpstream(t, writeFreeTier403)
+	defer restore()
+
+	body, status, _, err := callOpenCodeAPI(context.Background(),
+		map[string]any{"model": "space-bunny-free"}, "space-bunny-free")
+	if got, want := hits.Load(), int64(keyPoolDefaultRetries+1); got != want {
+		t.Fatalf("应换 key 试满预算（%d 次上游），实际 %d 次", want, got)
+	}
+	if err == nil || status != http.StatusForbidden {
+		t.Fatalf("试满后应回上游原始 403 + error，得到 status=%d err=%v", status, err)
+	}
+	if !strings.Contains(string(body), "FreeTierError") {
+		t.Fatalf("应透传上游原始错误体，得到 %s", body)
+	}
+}
+
+// 注：「只换 key、不换出口」这条策略没有单测 —— 出口轮转只在 switch 类出口模式下生效，
+// 而那种模式下 getHTTPClient 会把请求交给 SOCKS5 dialer，假上游够不着，单测钉不住。
+// 该策略由代码（`if !freeTier403 { rotateSocks5OnRateLimit }`）与金丝雀日志的 `exit=`
+// 字段（403 那一发与重试那一发必须相同）共同覆盖。

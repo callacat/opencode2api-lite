@@ -767,12 +767,13 @@ func ocFreeTierHint() string {
 //
 // 403 是硬失败、不是临时故障，且几道门任一失效都表现为它，故不受 debugMode 约束 ——
 // 生产默认不开 -debug，此前这类 403 在日志里完全不可见。
-func logFreeTierRejection(ctx context.Context, modelID string, status int, body []byte) {
-	if status != http.StatusForbidden || !bytes.Contains(body, []byte("FreeTierError")) {
+// key_id 与 429 行对齐：判「是粘滞 key 撞上失效集合，还是这道门整体失效」全靠它。
+func logFreeTierRejection(ctx context.Context, modelID, keyID string, status int, body []byte) {
+	if !isFreeTier403(status, body) {
 		return
 	}
-	log.Printf("%s[free tier rejected] model=%s status=%d body=%s hint=%s",
-		labelPrefix(ctx), modelID, status, string(body), ocFreeTierHint())
+	log.Printf("%s[free tier rejected] model=%s key_id=%s status=%d body=%s hint=%s",
+		labelPrefix(ctx), modelID, keyID, status, string(body), ocFreeTierHint())
 }
 
 // ocSessionRe 匹配 OpenCode 会话 id：ses_ + 12 位小写十六进制 + 14 位 [A-Za-z0-9]。
@@ -1454,6 +1455,20 @@ func isRetryableQuotaUpstream(status int, body []byte) bool {
 		return true
 	}
 	return status == http.StatusForbidden && bytes.Contains(body, []byte("Endpoint is unavailable"))
+}
+
+// isFreeTier403 判定「凭据级」的 403 FreeTierError。
+//
+// CMP-109（2026-10-17 14:12–14:16 CST）现网五个免费层模型同时刻全灭，受控金丝雀
+// 同窗口交错复现：池里 k1/k2/k10 回 200 而 k43/k86 稳定回 403 FreeTierError，
+// 会话新鲜度与出口两条假设都被单变量实验证伪。⇒ 上游对**部分凭据**回这道门，
+// 粘滞 key 一旦撞上失效集合就整机 403，而池中其余凭据全部闲置、且不自愈。
+//
+// 修法只换 key：换出口/换会话已被实验证伪，跟着换只会白烧额度。
+// 别宽成整个 `type:"server_error"`：同 type 下 `Model is unavailable` 是模型已下线的
+// 永久错误（实测 400），拖进重试同样白烧。
+func isFreeTier403(status int, body []byte) bool {
+	return status == http.StatusForbidden && bytes.Contains(body, []byte("FreeTierError"))
 }
 
 // quotaBreakerBlocked 熔断期内返回缓存的 Retry-After 与 true。
@@ -3010,7 +3025,9 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 		resp.Body.Close()
 		// 429 与「403 + Endpoint is unavailable」是同一类瞬时上游错误的两种状态码形态（CMP-46），
 		// 两种都要换出口/换凭据再试。配额语义只有 429 有：403 形态不是额度耗尽，永远换 key。
-		if isRetryableQuotaUpstream(resp.StatusCode, errBody) {
+		// 403 FreeTierError 是第三种：上游按凭据回的门（CMP-109），换 key 能自救。
+		freeTier403 := isFreeTier403(resp.StatusCode, errBody)
+		if freeTier403 || isRetryableQuotaUpstream(resp.StatusCode, errBody) {
 			retryAfter := resp.Header.Get("Retry-After")
 			quota := resp.StatusCode == http.StatusTooManyRequests && isQuotaClass429(resp.Header, errBody)
 			nextKey := ""
@@ -3033,12 +3050,16 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 				log.Printf("%s[quota exhausted] model=%s attempt=%d retry_after=%q 不换 key/出口，透传上游 429", labelPrefix(ctx), modelID, attempt, retryAfter)
 				return lastBody, lastStatus, lastHeader, lastErr
 			}
-			rotateSocks5OnRateLimit(ctx)
+			// FreeTierError 是凭据级门，只换 key 不跟换出口：换出口/换会话已被
+			// CMP-109 的单变量实验证伪，跟着换只会白烧额度。
+			if !freeTier403 {
+				rotateSocks5OnRateLimit(ctx)
+			}
 			if attempt < attempts {
 				continue
 			}
 		}
-		logFreeTierRejection(ctx, modelID, resp.StatusCode, errBody)
+		logFreeTierRejection(ctx, modelID, keyID, resp.StatusCode, errBody)
 		// 没进任何重试分支的上游非 2xx 一律无条件记一行：此前只有 -debug 才可见，
 		// 而生产默认不开 -debug ⇒ 这些错误（400 `Model is unavailable`、各类 5xx、
 		// 上游换措辞后的新 4xx）在日志里完全不可观测。
@@ -3110,8 +3131,10 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		// 与 callOpenCodeAPI 同源：429 与「403 + Endpoint is unavailable」都换出口/换凭据再试。
-		if isRetryableQuotaUpstream(resp.StatusCode, errBody) {
+		// 与 callOpenCodeAPI 同源：429 与「403 + Endpoint is unavailable」都换出口/换凭据再试，
+		// 「403 + FreeTierError」只换凭据（见 isFreeTier403）。
+		freeTier403 := isFreeTier403(resp.StatusCode, errBody)
+		if freeTier403 || isRetryableQuotaUpstream(resp.StatusCode, errBody) {
 			retryAfter := resp.Header.Get("Retry-After")
 			quota := resp.StatusCode == http.StatusTooManyRequests && isQuotaClass429(resp.Header, errBody)
 			nextKey := ""
@@ -3128,12 +3151,16 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 				log.Printf("%s[quota exhausted] model=%s attempt=%d retry_after=%q 不换 key/出口，透传上游 429", labelPrefix(ctx), modelID, attempt, retryAfter)
 				return io.NopCloser(bytes.NewReader(errBody)), resp.StatusCode, resp.Header.Clone(), nil
 			}
-			rotateSocks5OnRateLimit(ctx)
+			// FreeTierError 是凭据级门，只换 key 不跟换出口：换出口/换会话已被
+			// CMP-109 的单变量实验证伪，跟着换只会白烧额度。
+			if !freeTier403 {
+				rotateSocks5OnRateLimit(ctx)
+			}
 			if attempt < attempts {
 				continue
 			}
 		}
-		logFreeTierRejection(ctx, modelID, resp.StatusCode, errBody)
+		logFreeTierRejection(ctx, modelID, keyID, resp.StatusCode, errBody)
 		// 同 callOpenCodeAPI：未进重试分支的上游非 2xx 无条件记一行，不再受 -debug 约束。
 		log.Printf("%s[upstream error] model=%s status=%d body=%s", labelPrefix(ctx), modelID, resp.StatusCode, string(errBody))
 		// 5xx（500/502/503/504…）不再重试：直接走下面的透传分支，把上游状态码与错误体原样交给客户端，
