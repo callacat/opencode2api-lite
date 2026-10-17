@@ -37,10 +37,16 @@ final class Updater {
     private static final String SUMS_ASSET = "sha256sums-android.txt";
     private static final String UA = "oc2api-android";
 
-    /** 出站超时一律 5s：卡面要求「断网/限流 5s 内降级」。 */
+    /** 查版本 / 拉清单一律 5s：卡面要求「断网/限流 5s 内降级」。 */
     private static final int TIMEOUT_MS = 5000;
-    /** 下载 APK 允许更长的读超时（几十 MB，5s 会误判成失败）。 */
-    private static final int DOWNLOAD_READ_TIMEOUT_MS = 30000;
+    /**
+     * 下载 APK 单独放宽：6MB 的包在真机（207）实测要一分钟以上，且末段会偶发停滞，
+     * 用 5s/30s 会把「慢」误判成「失败」。
+     */
+    private static final int DOWNLOAD_CONNECT_TIMEOUT_MS = 15000;
+    private static final int DOWNLOAD_READ_TIMEOUT_MS = 60000;
+    /** 下载失败重试次数（含首次）。 */
+    private static final int DOWNLOAD_ATTEMPTS = 2;
     /** 清单文本很小，超过这个大小说明拿到的不是清单。 */
     private static final int MAX_TEXT_BYTES = 64 * 1024;
 
@@ -162,7 +168,7 @@ final class Updater {
     }
 
     private static JSONObject fetchLatestRelease() throws Exception {
-        HttpURLConnection c = open(LATEST_API, TIMEOUT_MS);
+        HttpURLConnection c = open(LATEST_API, TIMEOUT_MS, TIMEOUT_MS);
         try {
             int code = c.getResponseCode();
             if (code != 200) {
@@ -183,6 +189,9 @@ final class Updater {
     /**
      * 下载 APK 到 app 私有缓存目录，**并且核过 sha256 才返回**。任何一个环节不合格都抛异常，
      * 调用方据此提示「检查失败/下载失败」，绝不进入安装。
+     *
+     * 失败重试一次：真机实测（207）这条链路到 objects.githubusercontent.com 会偶发中途停滞
+     * （5.9MB/6.2MB 处 timeout），一次重试即可跨过。残包在下一次尝试里被截断重写，失败后删除。
      */
     static File download(Context ctx, Result r, Progress cb) throws IOException {
         if (r.apkUrl.isEmpty() || r.sumsUrl.isEmpty()) {
@@ -194,24 +203,29 @@ final class Updater {
         }
         File apk = new File(dir, r.apkName);
 
-        downloadTo(r.apkUrl, apk, cb);
-        try {
-            String sums = fetchText(r.sumsUrl);
-            if (!Sha256.matches(sums, r.apkName, apk)) {
-                throw new IOException("sha256 校验不通过（清单里没有该文件或哈希不符）");
+        IOException last = null;
+        for (int attempt = 0; attempt < DOWNLOAD_ATTEMPTS; attempt++) {
+            try {
+                downloadTo(r.apkUrl, apk, cb);
+                if (!Sha256.matches(fetchText(r.sumsUrl), r.apkName, apk)) {
+                    throw new IOException("sha256 校验不通过（清单里没有该文件或哈希不符）");
+                }
+                return apk;
+            } catch (IOException e) {
+                last = e;
+                // 半截文件留在缓存里只会被误装，删掉重来。
+                //noinspection ResultOfMethodCallIgnored
+                apk.delete();
+                if (cb != null) {
+                    cb.onProgress(0);
+                }
             }
-        } catch (IOException e) {
-            // 校验不通过的文件留在缓存里只会被误装，直接删掉。
-            //noinspection ResultOfMethodCallIgnored
-            apk.delete();
-            throw e;
         }
-        return apk;
+        throw last;
     }
 
     private static void downloadTo(String url, File dest, Progress cb) throws IOException {
-        HttpURLConnection c = open(url, TIMEOUT_MS);
-        c.setReadTimeout(DOWNLOAD_READ_TIMEOUT_MS);
+        HttpURLConnection c = open(url, DOWNLOAD_CONNECT_TIMEOUT_MS, DOWNLOAD_READ_TIMEOUT_MS);
         try {
             int code = c.getResponseCode();
             if (code != 200) {
@@ -242,7 +256,7 @@ final class Updater {
     }
 
     private static String fetchText(String url) throws IOException {
-        HttpURLConnection c = open(url, TIMEOUT_MS);
+        HttpURLConnection c = open(url, TIMEOUT_MS, TIMEOUT_MS);
         try {
             if (c.getResponseCode() != 200) {
                 throw new IOException("拉取 sha256 清单返回 " + c.getResponseCode());
@@ -253,10 +267,11 @@ final class Updater {
         }
     }
 
-    private static HttpURLConnection open(String url, int timeoutMs) throws IOException {
+    private static HttpURLConnection open(String url, int connectTimeoutMs, int readTimeoutMs)
+            throws IOException {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        c.setConnectTimeout(timeoutMs);
-        c.setReadTimeout(timeoutMs);
+        c.setConnectTimeout(connectTimeoutMs);
+        c.setReadTimeout(readTimeoutMs);
         c.setInstanceFollowRedirects(true);
         c.setRequestProperty("User-Agent", UA);
         c.setRequestProperty("Accept", "application/vnd.github+json");
