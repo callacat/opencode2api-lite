@@ -10,3 +10,18 @@ dist/
 # 本地临时
 *.log
 .DS_Store
+
+# ── Android ──
+# Gradle / AGP 产物
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.kotlin/
+
+# 交叉编译产物：由 CI 生成后铺进 jniLibs，不入库
+android/app/src/main/jniLibs/*/*.so
+
+# 签名材料一律不入库（CI 走 secrets 或临时自签）
+*.keystore
+*.jks

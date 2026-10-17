@@ -1,0 +1,232 @@
+# Android APK 构建与发布
+#
+# 触发：v* 标签推送 + 手动触发。
+# 流程：go-so（NDK 交叉编译 liboc2api.so × 2 ABI）→ apk（Gradle assembleRelease + 签名 + 验签）
+#       → 产物上传 artifact；tag 推送时附到同名 Release。
+#
+# 为什么不用 ./gradlew：仓库里不放 gradle-wrapper.jar（二进制），改由 setup-gradle 提供
+# 固定版本的 gradle 命令。本地要跑请自行装 Gradle 8.9（且本机按 D7 约束不许跑构建）。
+name: Android APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: '26.1.10909125'
+  GRADLE_VERSION: '8.9'
+  BUILD_TOOLS: '34.0.0'
+  # Android 二进制的产物名。必须 lib 前缀 + .so 后缀，
+  # 否则系统安装时不解压到 nativeLibraryDir，也就没有可执行权限（Android 10+ W^X）。
+  SO_NAME: liboc2api.so
+
+jobs:
+  # ── 1. NDK 交叉编译：GOOS=android 必须 CGO_ENABLED=1，否则纯 Go resolver 在
+  #       Android 上没有 /etc/resolv.conf，DNS 全挂（golang/go#8877）。
+  go-so:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            goarch: arm64
+            cc: aarch64-linux-android21-clang
+          - abi: x86_64
+            goarch: amd64
+            cc: x86_64-linux-android21-clang
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Go 1.26
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: true
+
+      - name: 准备 Android SDK / NDK
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 NDK
+        run: sdkmanager --install "ndk;${NDK_VERSION}"
+
+      - name: 交叉编译 ${{ matrix.abi }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -z "$VERSION" ] && VERSION="dev"
+          printf '%s' "$VERSION" | grep -Eq '^[0-9A-Za-z._-]+$' || VERSION="dev"
+
+          NDK="$ANDROID_HOME/ndk/${NDK_VERSION}"
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.cc }}"
+          [ -x "$CC" ] || { echo "找不到编译器 $CC"; ls "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" | head -40; exit 1; }
+
+          OUT="dist/${{ matrix.abi }}/${SO_NAME}"
+          mkdir -p "$(dirname "$OUT")"
+          CGO_ENABLED=1 GOOS=android GOARCH=${{ matrix.goarch }} CC="$CC" \
+            go build -trimpath -buildmode=pie \
+            -ldflags="-s -w -X main.version=${VERSION}" \
+            -o "$OUT" .
+
+          echo "== file =="
+          file "$OUT"
+          echo "== 动态依赖（必须有 libc，netgo 纯静态版不会有 NEEDED 行）=="
+          readelf -d "$OUT" | grep -E 'NEEDED|interpreter' || true
+          echo "== ELF interpreter（Android 动态链接器）=="
+          readelf -l "$OUT" | grep -A1 'INTERP' || true
+          ls -l "$OUT"
+
+      - name: 上传 .so
+        uses: actions/upload-artifact@v4
+        with:
+          name: so-${{ matrix.abi }}
+          path: dist/${{ matrix.abi }}/${{ env.SO_NAME }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # ── 2. 组包：拉 .so 进 jniLibs → Gradle 出签名 APK → 验签 + sha256
+  apk:
+    needs: go-so
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 准备 Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 platform / build-tools
+        run: sdkmanager --install "platforms;android-34" "build-tools;${BUILD_TOOLS}"
+
+      - name: 设置 Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: 取出交叉编译的 .so 放进 jniLibs
+        uses: actions/download-artifact@v4
+        with:
+          path: so
+          pattern: so-*
+      - name: 铺 jniLibs
+        run: |
+          set -euo pipefail
+          mkdir -p android/app/src/main/jniLibs
+          for d in so/so-*; do
+            abi="${d#so/so-}"
+            mkdir -p "android/app/src/main/jniLibs/${abi}"
+            cp "${d}/${SO_NAME}" "android/app/src/main/jniLibs/${abi}/${SO_NAME}"
+            chmod 644 "android/app/src/main/jniLibs/${abi}/${SO_NAME}"
+          done
+          find android/app/src/main/jniLibs -type f -printf '%p %s bytes\n' | sort
+
+      - name: 解析版本号（单一来源 = git tag）
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -z "$VERSION" ] && VERSION="dev"
+          printf '%s' "$VERSION" | grep -Eq '^[0-9A-Za-z._-]+$' || VERSION="dev"
+          if printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            CODE=$(awk -F. '{printf "%d", $1*10000+$2*100+$3}' <<<"$VERSION")
+          else
+            CODE="${GITHUB_RUN_NUMBER:-1}"
+          fi
+          echo "OC2API_VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "OC2API_VERSION_CODE=${CODE}" >> "$GITHUB_ENV"
+          echo "APK_NAME=oc2api-android-${VERSION}.apk" >> "$GITHUB_ENV"
+          echo "版本 versionName=${VERSION} versionCode=${CODE}"
+
+      - name: 准备 release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          S_STORE: ${{ secrets.STORE_PASSWORD }}
+          S_ALIAS: ${{ secrets.KEY_ALIAS }}
+          S_KEY: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KS="$RUNNER_TEMP/release.keystore"
+          if [ -n "${KEYSTORE_B64}" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$KS"
+            {
+              echo "ANDROID_KEYSTORE_PATH=$KS"
+              echo "STORE_PASSWORD=$S_STORE"
+              echo "KEY_ALIAS=$S_ALIAS"
+              echo "KEY_PASSWORD=$S_KEY"
+            } >> "$GITHUB_ENV"
+            echo "使用仓库 secrets 里的固定 keystore。"
+          else
+            # 临时自签：只为让本次 CI 出一个"能验签"的 APK。签名身份每次运行都不同，
+            # 不同次构建的 APK 不能互相覆盖安装。要长期分发请在仓库 secrets 配置
+            # ANDROID_KEYSTORE_B64 / STORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD。
+            PW="$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 24)"
+            keytool -genkeypair -v \
+              -keystore "$KS" -storetype PKCS12 \
+              -alias oc2api -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PW" -keypass "$PW" \
+              -dname "CN=oc2api ephemeral, OU=ci, O=callacat, C=CN"
+            {
+              echo "ANDROID_KEYSTORE_PATH=$KS"
+              echo "STORE_PASSWORD=$PW"
+              echo "KEY_ALIAS=oc2api"
+              echo "KEY_PASSWORD=$PW"
+            } >> "$GITHUB_ENV"
+            echo "::warning::未配置 ANDROID_KEYSTORE_B64，本次使用临时自签 keystore（不可用于覆盖安装）。"
+          fi
+
+      - name: 构建 release APK
+        run: gradle -p android --no-daemon --stacktrace assembleRelease
+
+      - name: 核验产物（sha256 + apksigner verify + jniLibs 清单）
+        run: |
+          set -euo pipefail
+          SRC="android/app/build/outputs/apk/release/app-release.apk"
+          [ -f "$SRC" ] || { echo "没有产物 $SRC"; find android/app/build/outputs -type f | head; exit 1; }
+          mkdir -p dist
+          cp "$SRC" "dist/${APK_NAME}"
+
+          echo "== unzip -l（确认两个 ABI 的 liboc2api.so 都在包内）=="
+          unzip -l "dist/${APK_NAME}" | grep -E 'lib/.*/liboc2api\.so' || { echo "APK 内没有 liboc2api.so"; exit 1; }
+
+          echo "== apksigner verify =="
+          APKSIGNER="$ANDROID_HOME/build-tools/${BUILD_TOOLS}/apksigner"
+          "$APKSIGNER" verify --verbose --print-certs "dist/${APK_NAME}"
+
+          echo "== sha256 =="
+          ( cd dist && sha256sum "${APK_NAME}" | tee sha256sums-android.txt )
+
+      - name: 上传 APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oc2api-android-apk
+          path: |
+            dist/*.apk
+            dist/sha256sums-android.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 附到 GitHub Release（仅 tag 推送）
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/*.apk dist/sha256sums-android.txt --clobber

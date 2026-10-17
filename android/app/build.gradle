@@ -1,0 +1,70 @@
+plugins {
+    id 'com.android.application'
+}
+
+// 版本单一来源 = git tag（CI 注入）。本地不注入时退化为 dev/1。
+def appVersion = System.getenv('OC2API_VERSION') ?: 'dev'
+def appVersionCode = (System.getenv('OC2API_VERSION_CODE') ?: '1').toInteger()
+
+// release 签名：只认环境变量，keystore 与口令一律不入库（.gitignore 已排除）。
+def ksPath = System.getenv('ANDROID_KEYSTORE_PATH')
+def ksStorePass = System.getenv('STORE_PASSWORD')
+def ksAlias = System.getenv('KEY_ALIAS')
+def ksKeyPass = System.getenv('KEY_PASSWORD')
+
+android {
+    namespace 'com.callacat.oc2api'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.callacat.oc2api'
+        minSdk 24
+        targetSdk 34
+        versionCode appVersionCode
+        versionName appVersion
+
+        // 两个 ABI 都由 CI 交叉编译后放进 jniLibs；这里只声明，不生成。
+        ndk {
+            abiFilters 'arm64-v8a', 'x86_64'
+        }
+    }
+
+    if (ksPath) {
+        signingConfigs {
+            release {
+                storeFile file(ksPath)
+                storePassword ksStorePass
+                keyAlias ksAlias
+                keyPassword ksKeyPass
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            // R8 全量：二进制和解包后 exec 靠 nativeLibraryDir，裁剪只影响 Java 侧。
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (ksPath) {
+                signingConfig signingConfigs.release
+            }
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packaging {
+        jniLibs {
+            // 交给系统在安装时解压到 nativeLibraryDir —— 那里是少数允许 exec 的目录，
+            // 压着不解压就没法执行（Android 10+ 的 W^X）。
+            useLegacyPackaging = true
+        }
+    }
+}
