@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      CMP-118 UI 基座。刻意只声明一个 DayNight 父主题、零自定义色值：
+      Material 3 自带完整浅色/深色两套 colorPrimary/colorOnSurface/colorSurface，
+      视图颜色一律取 ?attr/*，这样深浅色两态的对比度由库保证 —— 这正是 x-tunnel r8f 那次
+      「深色下连接按钮看不见、点了才显形」的根因（硬编码色 vs 主题色）。别在这里加 #RRGGBB。
+    -->
+    <style name="Theme.Oc2api" parent="Theme.Material3.DayNight.NoActionBar" />
+</resources>
