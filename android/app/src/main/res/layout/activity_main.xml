@@ -71,14 +71,14 @@
 
     <!-- ── 配置（可滚动，weight 让位给日志）── -->
     <!--
-      配置区权重给到 2（日志 1）：1080x1920 实测配置卡内容高约 1200px，
+      配置区权重给到 5（日志 2）：1080x1920 实测配置卡内容高约 1200px，
       而状态卡+操作栏之外的可用空间约 1100px，1:2 时配置只分到 ~390px ——
       LAN 开关被挤到首屏之外，必须先滑动才够得着。2:1 让首屏就能看到端口/密码/LAN。
     -->
     <ScrollView
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="2"
+        android:layout_weight="5"
         android:fillViewport="false">
 
         <com.google.android.material.card.MaterialCardView
