@@ -11,4 +11,6 @@
     <string name="battery">忽略电池优化（长时后台用）</string>
     <string name="need_password">局域网模式必须设置面板密码</string>
     <string name="bad_port">端口需在 1024-65535 之间</string>
+    <string name="version_unknown">当前版本未知</string>
+    <string name="check_update">检查更新</string>
 </resources>
