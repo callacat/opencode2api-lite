@@ -43,16 +43,6 @@ jobs:
   #       Android 上没有 /etc/resolv.conf，DNS 全挂（golang/go#8877）。
   go-so:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - abi: arm64-v8a
-            goarch: arm64
-            cc: aarch64-linux-android21-clang
-          - abi: x86_64
-            goarch: amd64
-            cc: x86_64-linux-android21-clang
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -64,43 +54,68 @@ jobs:
           check-latest: true
           cache: true
 
-      - name: 准备 Android SDK / NDK
-        uses: android-actions/setup-android@v3
+      # 不用 android-actions/setup-android：它在当前 runner 镜像上会跑 `sdkmanager tools`，
+      # 而 cmdline-tools 16.0 已不再提供该包，直接 "Failed to find package 'tools'" 退出。
+      # ubuntu-latest 自带 SDK，直接用它自己的 sdkmanager 即可。
+      - name: 安装 Android NDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "SDK=$SDK"
+          SDKMGR="$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -1 || true)"
+          [ -n "$SDKMGR" ] || SDKMGR="$(command -v sdkmanager)"
+          echo "sdkmanager=$SDKMGR"
+          yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
+          "$SDKMGR" --install "ndk;${NDK_VERSION}"
+          NDK_DIR="$SDK/ndk/${NDK_VERSION}"
+          if [ ! -d "$NDK_DIR" ]; then
+            echo "未装到 $NDK_DIR，现有："; ls "$SDK/ndk" || true; exit 1
+          fi
+          {
+            echo "ANDROID_SDK=$SDK"
+            echo "ANDROID_HOME=$SDK"
+            echo "ANDROID_SDK_ROOT=$SDK"
+            echo "ANDROID_NDK_HOME=$NDK_DIR"
+          } >> "$GITHUB_ENV"
 
-      - name: 安装 NDK
-        run: sdkmanager --install "ndk;${NDK_VERSION}"
-
-      - name: 交叉编译 ${{ matrix.abi }}
+      # 两个 ABI 合在一个 job：NDK 有 ~1GB，矩阵拆开要下两遍。
+      - name: 交叉编译 liboc2api.so（arm64-v8a + x86_64）
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           [ -z "$VERSION" ] && VERSION="dev"
           printf '%s' "$VERSION" | grep -Eq '^[0-9A-Za-z._-]+$' || VERSION="dev"
 
-          NDK="$ANDROID_HOME/ndk/${NDK_VERSION}"
-          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.cc }}"
-          [ -x "$CC" ] || { echo "找不到编译器 $CC"; ls "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" | head -40; exit 1; }
+          TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          [ -d "$TC" ] || { echo "找不到工具链目录 $TC"; ls "$ANDROID_NDK_HOME" || true; exit 1; }
 
-          OUT="dist/${{ matrix.abi }}/${SO_NAME}"
-          mkdir -p "$(dirname "$OUT")"
-          CGO_ENABLED=1 GOOS=android GOARCH=${{ matrix.goarch }} CC="$CC" \
-            go build -trimpath -buildmode=pie \
-            -ldflags="-s -w -X main.version=${VERSION}" \
-            -o "$OUT" .
+          build_one() {
+            abi="$1"; goarch="$2"; cc="$3"
+            [ -x "$TC/$cc" ] || { echo "找不到编译器 $TC/$cc"; ls "$TC" | head -40; return 1; }
+            out="dist/${abi}/${SO_NAME}"
+            mkdir -p "$(dirname "$out")"
+            CGO_ENABLED=1 GOOS=android GOARCH="$goarch" CC="$TC/$cc" \
+              go build -trimpath -buildmode=pie \
+              -ldflags="-s -w -X main.version=${VERSION}" \
+              -o "$out" .
+            echo "== ${abi} =="
+            file "$out"
+            echo "-- 动态依赖（必须有 libc；netgo 纯静态版不会有 NEEDED 行）--"
+            readelf -d "$out" | grep -E 'NEEDED' || true
+            echo "-- ELF interpreter --"
+            readelf -l "$out" | grep -A1 'INTERP' || true
+            ls -l "$out"
+          }
 
-          echo "== file =="
-          file "$OUT"
-          echo "== 动态依赖（必须有 libc，netgo 纯静态版不会有 NEEDED 行）=="
-          readelf -d "$OUT" | grep -E 'NEEDED|interpreter' || true
-          echo "== ELF interpreter（Android 动态链接器）=="
-          readelf -l "$OUT" | grep -A1 'INTERP' || true
-          ls -l "$OUT"
+          build_one arm64-v8a arm64 aarch64-linux-android21-clang
+          build_one x86_64    amd64 x86_64-linux-android21-clang
+          find dist -type f -printf '%p %s bytes\n' | sort
 
       - name: 上传 .so
         uses: actions/upload-artifact@v4
         with:
-          name: so-${{ matrix.abi }}
-          path: dist/${{ matrix.abi }}/${{ env.SO_NAME }}
+          name: so
+          path: dist/*/${{ env.SO_NAME }}
           if-no-files-found: error
           retention-days: 14
 
@@ -118,11 +133,20 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: 准备 Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: 安装 platform / build-tools
-        run: sdkmanager --install "platforms;android-34" "build-tools;${BUILD_TOOLS}"
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMGR="$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -1 || true)"
+          [ -n "$SDKMGR" ] || SDKMGR="$(command -v sdkmanager)"
+          echo "sdkmanager=$SDKMGR"
+          yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
+          "$SDKMGR" --install "platforms;android-34" "build-tools;${BUILD_TOOLS}"
+          {
+            echo "ANDROID_HOME=$SDK"
+            echo "ANDROID_SDK_ROOT=$SDK"
+          } >> "$GITHUB_ENV"
+          ls "$SDK/build-tools"
 
       - name: 设置 Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -132,16 +156,16 @@ jobs:
       - name: 取出交叉编译的 .so 放进 jniLibs
         uses: actions/download-artifact@v4
         with:
+          name: so
           path: so
-          pattern: so-*
       - name: 铺 jniLibs
         run: |
           set -euo pipefail
           mkdir -p android/app/src/main/jniLibs
-          for d in so/so-*; do
-            abi="${d#so/so-}"
+          for d in so/*/; do
+            abi="$(basename "$d")"
             mkdir -p "android/app/src/main/jniLibs/${abi}"
-            cp "${d}/${SO_NAME}" "android/app/src/main/jniLibs/${abi}/${SO_NAME}"
+            cp "${d}${SO_NAME}" "android/app/src/main/jniLibs/${abi}/${SO_NAME}"
             chmod 644 "android/app/src/main/jniLibs/${abi}/${SO_NAME}"
           done
           find android/app/src/main/jniLibs -type f -printf '%p %s bytes\n' | sort
