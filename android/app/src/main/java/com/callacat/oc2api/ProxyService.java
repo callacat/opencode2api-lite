@@ -45,6 +45,18 @@ public class ProxyService extends Service {
     static final String KEY_LAN = "lan";
     static final String KEY_PASSWORD = "password";
     static final String KEY_DEBUG = "debug";
+    /** 真实服务状态（CMP-118）。UI 靠它渲染按钮三态，不靠"点了按钮"这种乐观假设。 */
+    static final String KEY_STATE = "state";
+    /** 状态为 error 时的可读原因，直接显示给用户。 */
+    static final String KEY_ERROR = "error";
+    /** 三档主题：system / light / dark（CMP-118，AppCompatDelegate 用）。 */
+    static final String KEY_THEME = "theme";
+
+    static final String STATE_IDLE = "idle";
+    static final String STATE_STARTING = "starting";
+    static final String STATE_RUNNING = "running";
+    static final String STATE_ERROR = "error";
+
     static final int DEFAULT_PORT = 8000;
 
     /** 必须 lib 前缀 + .so 后缀：否则系统不解压到 nativeLibraryDir，也就不可执行。 */
@@ -75,6 +87,18 @@ public class ProxyService extends Service {
         return prefs.getBoolean(KEY_LAN, false);
     }
 
+    /**
+     * 把状态写进 prefs，Activity 用 OnSharedPreferenceChangeListener 监听。
+     * 走 prefs 而不是 binder/broadcast：这个 app 只有两个类，一个键值通道够了，
+     * 也顺带跨 Activity 重建存活（重开后立刻能读到服务当前在干什么）。
+     */
+    private void setState(String state, String error) {
+        prefs(this).edit()
+                .putString(KEY_STATE, state)
+                .putString(KEY_ERROR, error == null ? "" : error)
+                .apply();
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -86,6 +110,7 @@ public class ProxyService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (!running) {
             running = true;
+            setState(STATE_STARTING, null);
             supervisor = new Thread(this::supervise, "oc2api-supervisor");
             supervisor.start();
         }
@@ -96,6 +121,7 @@ public class ProxyService extends Service {
     @Override
     public void onDestroy() {
         running = false;
+        setState(STATE_IDLE, null);
         Process p = process;
         if (p != null) {
             // destroy() 对 native 进程是 SIGTERM；Go 侧没有信号处理，会直接退出。
@@ -120,6 +146,8 @@ public class ProxyService extends Service {
             } catch (IOException e) {
                 Log.e(TAG, "启动代理进程失败: " + e);
                 updateNotification("启动失败：" + e.getMessage());
+                // 按钮必须回到可点的"已停止"并给出原因，不能停在"启动中"假装还在跑。
+                setState(STATE_ERROR, "启动失败：" + e.getMessage());
                 if (!sleepBackoff(attempt++)) {
                     return;
                 }
@@ -142,6 +170,7 @@ public class ProxyService extends Service {
             }
             Log.w(TAG, "代理进程退出 code=" + code + "（存活 " + uptime + "ms），准备重启");
             updateNotification("代理已退出（code=" + code + "），重启中…");
+            setState(STATE_ERROR, "进程已退出（code=" + code + "），正在自动重启");
             if (!sleepBackoff(attempt++)) {
                 return;
             }
@@ -216,9 +245,12 @@ public class ProxyService extends Service {
         updateNotification(lan
                 ? "局域网共享中（0.0.0.0:" + port + "）"
                 : "运行中 http://127.0.0.1:" + port + "/");
+        // 子进程拉起来就算 running；真绑不上端口这类失败会在毫秒内退出，
+        // 由 supervise() 的 exit 分支翻成 error，两边不重叠。
+        setState(STATE_RUNNING, null);
     }
 
-    /** 把子进程 stdout/stderr 逐行转进 logcat —— 真机验收就靠这个抓 cgo resolver 与上游日志。 */
+    /** 把子进程 stdout/stderr 逐行转进 logcat 与日志环形缓冲（GUI 日志页读它）。 */
     private void pump(Process p) {
         Thread t = new Thread(() -> {
             try (BufferedReader r = new BufferedReader(
@@ -226,6 +258,7 @@ public class ProxyService extends Service {
                 String line;
                 while ((line = r.readLine()) != null) {
                     Log.i(TAG, line);
+                    LogBuffer.append(getFilesDir(), line);
                 }
             } catch (IOException e) {
                 Log.w(TAG, "读取子进程输出结束: " + e.getMessage());

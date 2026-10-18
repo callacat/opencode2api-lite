@@ -68,3 +68,14 @@ android {
         }
     }
 }
+
+dependencies {
+    // UI 基座（CMP-118）：AppCompatActivity + AppCompatDelegate.setDefaultNightMode 是三档主题
+    // 切换的前提，Material 3 组件（MaterialButton/MaterialCardView/TextInputLayout）自带的
+    // ripple 与 DayNight 取色也都来自这两个库。都不引就只能自己造主题与画按钮动效。
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.12.0'
+
+    // 只用于 JVM 单测（版本比对 / 缓存 TTL / sha256 校验），不进 APK。
+    testImplementation 'junit:junit:4.13.2'
+}

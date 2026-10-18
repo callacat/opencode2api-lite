@@ -11,4 +11,27 @@
     <string name="battery">忽略电池优化（长时后台用）</string>
     <string name="need_password">局域网模式必须设置面板密码</string>
     <string name="bad_port">端口需在 1024-65535 之间</string>
+    <string name="version_unknown">当前版本未知</string>
+    <string name="check_update">检查更新</string>
+
+    <!-- CMP-118 -->
+    <!-- 东哥拍板的默认面板密码。单独一个资源位，Java 侧不写死字符串。 -->
+    <string name="default_password" translatable="false">123456</string>
+    <string name="password_warn">当前是默认密码，局域网模式下等同没有保护，建议修改</string>
+    <string name="password_autofilled">已自动填入默认密码，请按需修改</string>
+    <string name="panel_open">打开面板</string>
+    <string name="panel_no_browser">没有可用的浏览器</string>
+    <string name="log_title">运行日志</string>
+    <string name="log_empty">暂无日志。点「启动」后代理的输出会逐行出现在这里。</string>
+    <string name="section_config">配置</string>
+    <string name="theme_title">主题</string>
+    <string name="theme_system">跟随系统</string>
+    <string name="theme_light">白天</string>
+    <string name="theme_dark">夜间</string>
+    <string name="state_running">代理运行中</string>
+    <string name="state_stopped">代理已停止</string>
+    <string name="state_starting">正在启动代理</string>
+    <string name="btn_start_desc">启动代理</string>
+    <string name="btn_stop_desc">停止代理</string>
+    <string name="btn_panel_desc">用系统浏览器打开管理面板</string>
 </resources>

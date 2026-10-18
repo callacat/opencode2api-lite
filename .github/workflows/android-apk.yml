@@ -153,6 +153,11 @@ jobs:
         with:
           gradle-version: ${{ env.GRADLE_VERSION }}
 
+      # 自更新（CMP-116）的判据全在纯 Java 侧：版本比对（含 "v" 前缀归一化）、缓存 TTL、
+      # sha256 清单解析与校验。JVM 单测不需要 .so，先跑、失败就先红，别等组完包才发现。
+      - name: 跑单测（版本比对 / 缓存 / sha256）
+        run: gradle -p android --no-daemon testDebugUnitTest
+
       - name: 取出交叉编译的 .so 放进 jniLibs
         uses: actions/download-artifact@v4
         with:

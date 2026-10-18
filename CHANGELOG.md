@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **Android APK 形态（CMP-111）**：同仓新增 `android/` Gradle 子工程与 `.github/workflows/android-apk.yml`，把代理以静态二进制形式打进 APK，手机上本地跑，WebView 直接复用自带管理面板，无需服务器。
+  - 代理源码**一行业务逻辑未动**；Android 侧只做「拉起进程 + 看守重启 + 显示面板」。
+  - 打包路径：`CGO_ENABLED=1 GOOS=android GOARCH=arm64|amd64` NDK 交叉编译 → `jniLibs/<abi>/liboc2api.so`（lib 前缀 + .so 后缀，系统安装时才会解压到 `nativeLibraryDir`，那是 Android 10+ W^X 下少数允许 exec 的目录）。
+  - 前台服务用 `specialUse` 而非 `dataSync`：后者在 Android 15+ 受 6h/24h 总时长上限，到点会被系统杀掉。
+  - 子进程看守：`START_STICKY` + 退出后 1s/2s/4s/8s/15s/30s 退避重启，活过 30s 清零退避。
+  - 产物：`oc2api-android-<version>.apk`（arm64-v8a + x86_64），CI 内 `apksigner verify` + `sha256sum`，tag 推送时附到对应 Release。
+
+- **Android GUI 美化（CMP-118）**：面板移出 app，改用系统浏览器打开；原 WebView 位置改日志视图；UI 美化（Material 3 深浅色主题、卡片分组、8dp 栅格、带色状态标识）；GUI 显示版本号（来自 git tag，单一来源）。
+  - `activity_main.xml` + 新建 `res/values/themes.xml`：Material3 DayNight 主题，跟随系统深浅色。
+  - `MainActivity.java`：删内嵌 WebView，「打开面板」按钮改 `ACTION_VIEW` 调系统浏览器；GUI 显示 `versionName`。
+  - `ProxyService.java`：Go 进程日志写内存环形缓冲（最多 1000 行），UI 读取显示。
+  - `AndroidManifest.xml`：补 `<queries>` 包可见性，允许调用系统浏览器打开 `http://127.0.0.1`。
+  - 不迁 Compose，保持 Java + XML；日志缓冲有上限（1000 行/256KB），禁无界 List。
+
 ### 修复
 
 - **`Endpoint is unavailable` 不再被当限流连打 5~6 把凭据**（CMP-129）。该 body 上游用

@@ -13,6 +13,25 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!--
+      自更新用：下载新 APK 后交给系统安装器。普通 app 没有静默安装，这条只换来
+      「能弹出系统安装确认界面」，装不装仍由用户在系统弹窗里点。Android 8+ 还需要
+      用户在设置里允许本应用「安装未知应用」（Updater.canRequestInstall 会先检查）。
+    -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!--
+      Android 11+（API 30）包可见性：不声明 queries 就 startActivity 调不起浏览器，
+      直接 ActivityNotFoundException。只放行 VIEW+http 这一条，不开全量可见。
+      注意 <queries> 必须是 <manifest> 的直接子元素，放进 <application> 里 AAPT 会报
+      "unexpected element <queries> found in <manifest><application>"（CI run 39030415711 实测）。
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="http" />
+        </intent>
+    </queries>
 
     <application
         android:allowBackup="false"
@@ -20,7 +39,7 @@
         android:label="@string/app_name"
         android:networkSecurityConfig="@xml/network_security_config"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.DeviceDefault.Light">
+        android:theme="@style/Theme.Oc2api">
 
         <activity
             android:name=".MainActivity"
