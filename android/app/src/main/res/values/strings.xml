@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">oc2api</string>
+    <string name="idle">未运行</string>
+    <string name="port_label">端口</string>
+    <string name="lan_label">局域网共享（强制要求面板密码）</string>
+    <string name="password_hint">面板密码（局域网模式必填）</string>
+    <string name="debug_label">调试日志</string>
+    <string name="start">启动</string>
+    <string name="stop">停止</string>
+    <string name="battery">忽略电池优化（长时后台用）</string>
+    <string name="need_password">局域网模式必须设置面板密码</string>
+    <string name="bad_port">端口需在 1024-65535 之间</string>
+</resources>
