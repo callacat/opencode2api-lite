@@ -45,6 +45,117 @@ func TestNormalizeOCVersion(t *testing.T) {
 	}
 }
 
+// TestParseOCUpdateAPIVersion 钉住权威版本源的解析：2.x 线只在官方更新服务
+// （npm 分发件 @opencode/cli），registry.npmjs.org/opencode-ai 与 GitHub releases
+// 都只给 1.19.x —— 拉错包会让 UA 变旧、直撞 floor 全量 403（2026-10-17 实测）。
+func TestParseOCUpdateAPIVersion(t *testing.T) {
+	cases := []struct {
+		name, body, want string
+	}{
+		{"优先 npm 分发件", `{"artifacts":[
+			{"distribution":"aur","version":"2.0.33","active":true},
+			{"distribution":"npm","version":"2.0.32","active":true}]}`, "2.0.32"},
+		{"无 npm 则取 active", `{"artifacts":[
+			{"distribution":"aur","version":"2.0.31","active":true},
+			{"distribution":"opencode","version":"9.9.9","active":false}]}`, "2.0.31"},
+		{"非 JSON", `<html>404</html>`, ""},
+		{"空 artifacts", `{"artifacts":[]}`, ""},
+	}
+	for _, c := range cases {
+		if got := parseOCUpdateAPIVersion([]byte(c.body)); got != c.want {
+			t.Errorf("%s: parseOCUpdateAPIVersion = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestAcceptUAVersion 钉住丢弃规则：取不到、或取到比兜底地板还旧的版本，
+// 一律不采用 —— 陈旧 UA 会吃 426，从不主动发。
+func TestAcceptUAVersion(t *testing.T) {
+	cases := []struct {
+		ver  string
+		want bool
+	}{
+		{"", false},
+		{"1.19.3", false},        // npm 旧包线，低于地板
+		{"2.0.31", false},        // 低于地板
+		{ocUABakedVersion, true}, // 等于地板
+		{"2.0.33", true},
+	}
+	for _, c := range cases {
+		if got := acceptUAVersion(c.ver); got != c.want {
+			t.Errorf("acceptUAVersion(%q) = %v, want %v", c.ver, got, c.want)
+		}
+	}
+}
+
+// TestUAVersionFollowsUpdateAPI 端到端（假上游，不打真实外网）：
+// 取到版本 → UA 拼成 opencode/latest/<版本>/cli；
+// 取不到 / 取到比地板旧 → 回退或保留兜底地板，绝不发更旧的版本号。
+func TestUAVersionFollowsUpdateAPI(t *testing.T) {
+	ocOnce.Do(func() {}) // 挡掉 initOCSession 里的真实外网探测
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("mode") {
+		case "ok":
+			fmt.Fprint(w, `{"artifacts":[{"distribution":"npm","version":"2.0.33","active":true}]}`)
+		case "stale":
+			fmt.Fprint(w, `{"artifacts":[{"distribution":"npm","version":"1.19.3","active":true}]}`)
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+
+	reset := func(t *testing.T, mode string) {
+		t.Helper()
+		old := ocUpdateAPIURL
+		ocUpdateAPIURL = srv.URL + "/cli?mode=" + mode
+		ocUAValue = atomic.Value{}
+		t.Cleanup(func() { ocUpdateAPIURL = old })
+	}
+
+	t.Run("取到版本即拼装", func(t *testing.T) {
+		reset(t, "ok")
+		if got := ocClientUA(); got != "opencode/latest/"+ocUABakedVersion+"/cli" {
+			t.Fatalf("冷缓存应先回兜底地板，得到 %q", got)
+		}
+		refreshOCUA()
+		if got, want := ocClientUA(), "opencode/latest/2.0.33/cli"; got != want {
+			t.Fatalf("UA 应拼成 %q，得到 %q", want, got)
+		}
+	})
+
+	t.Run("取不到则保留当前", func(t *testing.T) {
+		reset(t, "ok")
+		refreshOCUA()
+		ocUpdateAPIURL = srv.URL + "/down"
+		refreshOCUA()
+		if got, want := ocClientUA(), "opencode/latest/2.0.33/cli"; got != want {
+			t.Fatalf("刷新失败应保留当前 UA，得到 %q", got)
+		}
+	})
+
+	t.Run("比地板旧则丢弃", func(t *testing.T) {
+		reset(t, "ok")
+		refreshOCUA()
+		ocUpdateAPIURL = srv.URL + "/stale"
+		refreshOCUA()
+		if got, want := ocClientUA(), "opencode/latest/2.0.33/cli"; got != want {
+			t.Fatalf("低于地板的版本应被丢弃，得到 %q", got)
+		}
+	})
+
+	t.Run("兜底地板不低于当前上游", func(t *testing.T) {
+		reset(t, "down")
+		if compareVersion(ocUABakedVersion, "2.0.32") < 0 {
+			t.Fatalf("兜底地板 %s 低于当前上游 2.0.32，取不到版本时会全量 426", ocUABakedVersion)
+		}
+		if got, want := ocClientUA(), buildOCUA(ocUABakedVersion); got != want {
+			t.Fatalf("冷启动兜底 UA 应为 %q，得到 %q", want, got)
+		}
+	})
+}
+
 // TestOCSessionInjection 钉住会话选取契约：配了 oc_session_id 就用配置值
 // （固定会话对「会话 sticky」有独立价值，且已上线，不退回去）；
 // 没配则自动生成反转时间戳会话——上游校验的是 ID 的时间戳结构而非「谁签发过」，

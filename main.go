@@ -527,9 +527,21 @@ var (
 )
 
 const (
-	// 官方 CLI 2.x 三段式 UA，逐字符是门禁的一部分
-	ocClientUA = "opencode/latest/2.0.29/cli"
+	// 免费层按 UA 里的版本号对「floor」判定（低于 floor 回 426），而 floor 随每次官方
+	// 发版移动 ⇒ 写死的常量会静默腐烂，这正是 2026-10-17 全量 403 FreeTierError 的根因。
+	// 因此版本从官方更新服务取，只在下面留一个兜底地板。
+	//
+	// 兜底地板：随官方发版手工抬。它同时是「取到的版本比它还旧 ⇒ 丢弃」的地板，
+	// 陈旧 UA 会吃 426，从不主动发。fetchOCVersion() 拉的 npm 1.x 线不能当这个地板。
+	ocUABakedVersion = "2.0.32"
 )
+
+// ocUpdateAPIURL 是权威版本源：2.x 线只在这里发布（npm 分发件名 @opencode/cli）。
+// 实测（2026-10-17）它给 2.0.32，而 registry.npmjs.org/opencode-ai/latest 与
+// GitHub releases/latest 都只给 1.19.3 —— 后两者带不动 2.x 线，从它们取会把
+// UA 弄得更旧、直接撞 floor。fetchOCVersion() 拉的就是后者，只用于日志展示。
+// 是 var 而非 const：单测要把它指到假上游（与 ocInferenceBase 同理）。
+var ocUpdateAPIURL = "https://opencode.ai/update/api/latest/cli"
 
 // minOCVersion / defaultOCVersion 只服务于 fetchOCVersion 的版本号下限校正（日志展示用），
 // 不再参与任何门禁判定。
@@ -657,12 +669,104 @@ func fetchOCVersion() string {
 	return defaultOCVersion
 }
 
+// ocUAValue 缓存发往上游的 UA。冷启动为空 ⇒ ocClientUA() 返回兜底地板。
+var ocUAValue atomic.Value // string
+
+// ocClientUA 返回发往上游的三段式 UA：opencode/<channel>/<version>/<client>。
+// 版本由官方更新服务解析（见 refreshOCUA），取不到时退回兜底地板。
+func ocClientUA() string {
+	if v, ok := ocUAValue.Load().(string); ok && v != "" {
+		return v
+	}
+	return buildOCUA(ocUABakedVersion)
+}
+
+// buildOCUA 拼出门禁要求的三段式 UA。抽成纯函数是为了 UA 形状可单测。
+func buildOCUA(version string) string {
+	return "opencode/latest/" + version + "/cli"
+}
+
+// fetchOCUpdateAPIVersion 从官方更新服务取 2.x 线最新 CLI 版本；取不到返回 ""。
+func fetchOCUpdateAPIVersion() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", ocUpdateAPIURL, nil)
+	req.Header.Set("Accept", "application/json")
+	client, _, err := getHTTPClient(ctx)
+	if err != nil {
+		return ""
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return parseOCUpdateAPIVersion(body)
+}
+
+// parseOCUpdateAPIVersion 从更新服务响应里挑出版本号：优先 npm 分发件，
+// 其次任一 active 的；都不合规返回 ""（调用方保留当前值）。
+// 抽成纯函数是为了可单测 —— 门禁版本错一个版本号就全量 403。
+func parseOCUpdateAPIVersion(body []byte) string {
+	var info struct {
+		Artifacts []struct {
+			Version      string `json:"version"`
+			Distribution string `json:"distribution"`
+			Active       *bool  `json:"active"`
+		} `json:"artifacts"`
+	}
+	if json.Unmarshal(body, &info) != nil {
+		return ""
+	}
+	for _, a := range info.Artifacts {
+		if a.Version != "" && a.Distribution == "npm" {
+			return a.Version
+		}
+	}
+	for _, a := range info.Artifacts {
+		if a.Version != "" && (a.Active == nil || *a.Active) {
+			return a.Version
+		}
+	}
+	return ""
+}
+
+// acceptUAVersion 决定要不要采用取到的版本号：空（解析/网络失败）或比兜底地板
+// 还旧 ⇒ 丢弃。低于 floor 的版本会吃 426，从不主动发。
+func acceptUAVersion(next string) bool {
+	return next != "" && compareVersion(next, ocUABakedVersion) >= 0
+}
+
+// refreshOCUA 用官方更新服务的版本刷新 UA。
+// 取失败、或取到的版本低于兜底地板，一律丢弃并保留当前值 ——
+// 陈旧 UA 会吃 426，宁可用已知可用的地板也不主动发一个更旧的版本号。
+func refreshOCUA() {
+	next := fetchOCUpdateAPIVersion()
+	if !acceptUAVersion(next) {
+		return
+	}
+	if compareVersion(next, ocUABakedVersion) > 0 {
+		log.Printf("[告警] UA 兜底地板已陈旧: baked=%s live=%s —— 请抬 ocUABakedVersion，"+
+			"否则官方更新服务不可达时 UA 会低于 floor 而全量 426", ocUABakedVersion, next)
+	}
+	ua := buildOCUA(next)
+	if cur, ok := ocUAValue.Load().(string); ok && cur == ua {
+		return
+	}
+	ocUAValue.Store(ua)
+	log.Printf("UA 版本已刷新: %s", ua)
+}
+
 func initOCSession() {
 	ocOnce.Do(func() {
 		ocClientVer = fetchOCVersion()
 		ocSessionID = ocCurrentSessionID()
 		ocProjectID = randomHex(40)
+		// 后台刷新：冷缓存先回兜底地板，启动与请求热路径都不等网络。
+		go refreshOCUA()
 		log.Printf("OpenCode Version: %s", ocClientVer)
+		log.Printf("UA: %s", ocClientUA())
 		log.Printf("Session: %s", ocSessionID)
 		log.Printf("Project: %s", ocProjectID)
 		if !hasInjectedOCSession() {
@@ -678,7 +782,8 @@ func refreshOCSession() {
 	ocClientVer = fetchOCVersion()
 	ocSessionID = ocCurrentSessionID()
 	ocProjectID = randomHex(40)
-	log.Printf("会话已刷新: version=%s session=%s", ocClientVer, ocSessionID)
+	go refreshOCUA()
+	log.Printf("会话已刷新: version=%s ua=%s session=%s", ocClientVer, ocClientUA(), ocSessionID)
 }
 
 // ======================== 模型 ========================
@@ -703,7 +808,7 @@ func fetchModels() ([]ModelInfo, error) {
 	req, _ := http.NewRequest("GET", ocInferenceBase+"/v1/models", nil)
 	sid := ocCurrentSessionID()
 	req.Header.Set("Authorization", "Bearer public")
-	req.Header.Set("User-Agent", ocClientUA)
+	req.Header.Set("User-Agent", ocClientUA())
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-session", sid)
 	req.Header.Set("x-opencode-session-id", sid)
@@ -756,7 +861,7 @@ var (
 // ocFreeTierHint 点名免费层门禁的校验项（2026-10-14 版），供 403 诊断日志引用
 func ocFreeTierHint() string {
 	return "免费层门禁（2026-10-14 版，任一不合即 403）：" +
-		"(1) 端点 /inference/v1；(2) UA 三段式 " + ocClientUA + "；" +
+		"(1) 端点 /inference/v1；(2) UA 三段式 " + ocClientUA() + "；" +
 		"(3) x-opencode-session-id=反转时间戳 ses_*（见 newOCSessionID）；" +
 		"(4) x-opencode-project 为裸 40hex，勿带 x-opencode-request 头；" +
 		"(5) tools 含 shell/edit/glob/grep/read 且同名工具是官方真实定义（ensureFreeTierTools 保证）；" +
@@ -2813,7 +2918,7 @@ func buildOCRequest(ctx context.Context, bodyBytes []byte) (*http.Request, strin
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Authorization", "Bearer "+auth)
-	req.Header.Set("User-Agent", ocClientUA)
+	req.Header.Set("User-Agent", ocClientUA())
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-session", sid)
 	req.Header.Set("x-opencode-session-id", sid)
