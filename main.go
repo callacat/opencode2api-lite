@@ -845,6 +845,7 @@ func fetchModels() ([]ModelInfo, error) {
 
 var (
 	port       string
+	listenAddr string
 	configPath = "config.json"
 	modelAlias = map[string]ModelAlias{}
 
@@ -1252,6 +1253,10 @@ type AppConfig struct {
 	ReasoningEffortMap map[string]string `json:"reasoning_effort_map"`
 	Socks5Proxies      []Socks5Proxy     `json:"socks5_proxies,omitempty"`
 	ActiveSocks5       string            `json:"active_socks5,omitempty"`
+
+	// ListenAddr 是监听主机（不含端口）。留空 = 沿用历史行为（":"+port，绑全网卡）。
+	// 命令行 -listen 与环境变量 OC_LISTEN_ADDR 优先于本字段。
+	ListenAddr string `json:"listen_addr,omitempty"`
 
 	// OCSessionID 是 OpenCode 客户端真实创建过的会话 id。上游 2026-10 起校验
 	// 会话存在性，编造的 ses_* 一律 403；留空则拒绝服务（503），不再编造。
@@ -6531,6 +6536,7 @@ func adminVersionHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	flag.StringVar(&port, "port", "8000", "服务端口")
+	flag.StringVar(&listenAddr, "listen", "", "监听地址（留空 = 绑全网卡，与历史行为一致；写 127.0.0.1 只绑回环。写非回环地址必须同时设 -password）")
 	flag.StringVar(&configPath, "config", "config.json", "配置文件路径")
 	flag.StringVar(&adminPassword, "password", "", "管理面板密码（留空则不启用登录验证）")
 	flag.BoolVar(&debugMode, "debug", false, "启用调试日志")
@@ -6544,6 +6550,14 @@ func main() {
 	applyConfig(cfg)
 	if err := saveConfig(configPath, cfg); err != nil {
 		log.Printf("警告: 无法保存配置: %v", err)
+	}
+
+	// 监听地址三级回落：-listen > OC_LISTEN_ADDR > config.listen_addr。都空 = 沿用历史行为。
+	listenAddr = resolveListenAddr(listenAddr, os.Getenv("OC_LISTEN_ADDR"), cfg.ListenAddr)
+	if listenAddr != "" {
+		if err := validateListenAddr(listenAddr, adminPassword); err != nil {
+			log.Fatalf("启动失败: %v", err)
+		}
 	}
 
 	if strings.TrimSpace(cfg.OCSessionRefreshCmd) != "" {
@@ -6588,7 +6602,7 @@ func main() {
 		}
 		http.NotFound(w, r)
 	})
-	addr := ":" + port
+	addr := listenAddrString(listenAddr, port)
 	log.Printf("服务器启动在 %s", addr)
 	go initializeOpenCode()
 	go statsFlusher()
@@ -6613,4 +6627,46 @@ func main() {
 		}
 		time.Sleep(2 * time.Second)
 	}
+}
+
+// resolveListenAddr 决定监听主机：命令行 > 环境变量 > 配置文件。
+// 三者都空时返回空串，表示沿用历史行为（":"+port，绑全网卡）。这里刻意不给默认值：
+// 改默认值会波及所有消费者（现网容器就不传 -listen），要只绑回环由调用方显式传。
+func resolveListenAddr(flagVal, envVal, cfgVal string) string {
+	for _, v := range []string{flagVal, envVal, cfgVal} {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// listenAddrString 把主机+端口拼成 http.Server 用的地址。
+// host 为空 = 沿用历史行为，绑全网卡（即 ":"+port）——这是老部署不传 -listen 时的路径。
+func listenAddrString(host, port string) string {
+	if strings.TrimSpace(host) == "" {
+		return ":" + port
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// isLoopbackHost 判断绑定主机是否只对本机可见。
+func isLoopbackHost(host string) bool {
+	h := strings.TrimSpace(host)
+	if h == "" || h == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(strings.Trim(h, "[]")); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// validateListenAddr 拦住「显式绑非回环地址却没有面板密码」的组合：面板能改上游会话与
+// 凭据池，裸暴露等于把凭据送人。只在调用方显式给地址时才校验，不传 -listen 的历史行为不受影响。
+func validateListenAddr(host, password string) error {
+	if isLoopbackHost(host) || strings.TrimSpace(password) != "" {
+		return nil
+	}
+	return fmt.Errorf("监听地址 %q 不是回环地址：对外共享必须同时设置面板密码（-password）", host)
 }
