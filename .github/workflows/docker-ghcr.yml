@@ -1,5 +1,5 @@
 # Docker 镜像构建与推送工作流
-# 触发：main 分支推送（latest 标签）+ v* 标签推送（semver 标签）+ 手动触发
+# 触发：main 分支推送（dev 标签）+ v* 标签推送（semver + latest 标签）+ 手动触发
 # 推送 linux/amd64 + linux/arm64 多架构镜像到 ghcr.io
 name: Docker GHCR
 
@@ -45,14 +45,17 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            # main 分支推送 latest；tag 推送推送语义化版本
-            type=raw,value=latest,enable={{is_default_branch}}
+            # main 分支推送 dev；tag 推送语义化版本 + latest
+            # latest 只能归 release tag：main 与 tag 常在同一秒推送、并发跑，
+            # 谁后推完谁赢 latest（CMP-157 现场：main 慢 44s，把 latest 覆写成 dev 版）。
+            # semver 那条经 flavor latest=auto 自动带 latest，无需另写 raw latest。
+            type=raw,value=dev,enable={{is_default_branch}}
             type=semver,pattern={{version}}
 
       - name: 计算镜像内版本号（-X main.version 注入）
         id: version
         run: |
-          # tag v1.0.0 → 1.0.0；main 分支（latest）→ dev
+          # tag v1.0.0 → 1.0.0；main 分支（dev 标签）→ dev
           # 版本单一来源 = release tag，镜像内二进制必须可验证，不能恒 dev。
           VERSION="${GITHUB_REF_NAME#v}"
           if [ -z "$VERSION" ] || [ "$VERSION" = "main" ]; then VERSION="dev"; fi

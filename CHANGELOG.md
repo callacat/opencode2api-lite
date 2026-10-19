@@ -22,6 +22,15 @@
 
 ### 修复
 
+- **`:latest` 镜像里的版本号不再是 `dev`（CMP-157）**。`:latest` 改为只由 release tag 产出，
+  main 分支改打 `:dev`（二进制版本号仍注入 `dev`，未改 `VERSION` 计算）。
+  - 现场根因不是 tag 推送没带 `latest`：v1.2.1 的 tag run（39124414931）**确实推了**
+    `latest@sha256:10ac393a`，与 `1.2.1` 同 digest；而同一 commit 的 main run（39124415286）
+    **晚 44s** 推 `latest@sha256:c909b297`（dev 版）把它覆盖了 —— 两 run 相隔 1s 并发，
+    `concurrency` 按 ref 分组互不取消，谁后推完谁赢。
+  - 因此 main 与 tag 同秒推送的既有发版习惯下，`:latest` 是掷硬币；让 main 不碰 `latest`
+    才能结构性保证「latest = 最新 release」。
+
 - **`Endpoint is unavailable` 不再被当限流连打 5~6 把凭据**（CMP-129）。该 body 上游用
   **429 与 403 两种状态码**回同一句话（CMP-86 修的是 403 形态，本次现场是 429 形态），
   但 429 形态落进「429 一律轮转」的窄判据：每个请求**换 5~6 把凭据连打**
