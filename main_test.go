@@ -1260,10 +1260,80 @@ func TestFreeTier403PassesThroughWhenBudgetExhausted(t *testing.T) {
 	}
 }
 
-// 注：「只换 key、不换出口」这条策略没有单测 —— 出口轮转只在 switch 类出口模式下生效，
-// 而那种模式下 getHTTPClient 会把请求交给 SOCKS5 dialer，假上游够不着，单测钉不住。
-// 该策略由代码（`if !freeTier403 { rotateSocks5OnRateLimit }`）与金丝雀日志的 `exit=`
-// 字段（403 那一发与重试那一发必须相同）共同覆盖。
+// TestFreeTier403RotatesExitOrFallsBackToDirect 是本卡的核心用例（CMP-130）：
+// 403 FreeTierError **不能只换 key**。CMP-128 实测被拒的是「整类出口」（mihomo 两个
+// 节点池 3/3 全 403，同刻直连 7/7 全 200），此时换 key 结构上无效 —— 现网日志
+// k31→k32→k33→k34→k35 五把 key 全 403 即此形态。修法是 403 也换出口：
+//   - 裸地址模式只有一条腿、无从轮转 → 内存回落直连（不落 config，重启即回原状）；
+//   - switch 模式复用 429 的轮转游标换到下一条腿；
+//   - 已经在直连上则不动（没有可回落的地方）。
+func TestFreeTier403RotatesExitOrFallsBackToDirect(t *testing.T) {
+	saveSocks := func() (string, []Socks5Proxy) {
+		socks5Mu.RLock()
+		defer socks5Mu.RUnlock()
+		return activeSocks5, append([]Socks5Proxy(nil), socks5Proxies...)
+	}
+	restore := func(active string, proxies []Socks5Proxy) {
+		socks5Mu.Lock()
+		defer socks5Mu.Unlock()
+		activeSocks5, socks5Proxies = active, proxies
+		atomic.StoreUint32(&socks5RateLimitIndex, 0)
+	}
+	oldActive, oldProxies := saveSocks()
+	defer restore(oldActive, oldProxies)
+
+	proxies := []Socks5Proxy{{Name: "OC出口", Addr: "mihomo:20819"}, {Name: "NVIDIA出口", Addr: "mihomo:20818"}}
+
+	t.Run("裸地址模式回落直连", func(t *testing.T) {
+		restore("mihomo:20819", proxies)
+		rotateSocks5OnFreeTier403(context.Background(), "OC出口 (mihomo:20819)")
+		socks5Mu.RLock()
+		got := activeSocks5
+		socks5Mu.RUnlock()
+		if got != "" {
+			t.Fatalf("整类出口被拒后应回落直连（activeSocks5 置空），实际 %q", got)
+		}
+	})
+
+	t.Run("已在直连上不动", func(t *testing.T) {
+		restore("", proxies)
+		rotateSocks5OnFreeTier403(context.Background(), "direct")
+		socks5Mu.RLock()
+		got := activeSocks5
+		socks5Mu.RUnlock()
+		if got != "" {
+			t.Fatalf("已经在直连上应保持不变，实际 %q", got)
+		}
+	})
+
+	t.Run("switch 模式换到下一条腿", func(t *testing.T) {
+		for _, mode := range []string{socks5RateLimitSwitch, socks5RateLimitSwitchNoDirect} {
+			restore(mode, proxies)
+			atomic.StoreUint32(&socks5RateLimitIndex, 0)
+			// 用 socks5ExitLabelLocked 取标签：它与生产日志 `exit=` / `[rate-limit proxy switch]`
+			// 那一行同源，是「这一发实际走了哪条腿」的权威口径。
+			// (__rate_limit_switch__ 的 idx 0 是 direct、no_direct 的 idx 0 是第 1 个代理。)
+			socks5Mu.RLock()
+			first := socks5ExitLabelLocked(0, mode == socks5RateLimitSwitch)
+			socks5Mu.RUnlock()
+			rotateSocks5OnFreeTier403(context.Background(), first)
+			if nextIdx := int(atomic.LoadUint32(&socks5RateLimitIndex)); nextIdx != 1 {
+				t.Errorf("%s：轮转游标应从 0 推到 1，实际 %d", mode, nextIdx)
+			}
+			socks5Mu.RLock()
+			next := socks5ExitLabelLocked(int(atomic.LoadUint32(&socks5RateLimitIndex)), mode == socks5RateLimitSwitch)
+			socks5Mu.RUnlock()
+			if next == first {
+				t.Errorf("%s：轮转后应换到另一条腿，实际仍是 %q", mode, next)
+			}
+		}
+	})
+}
+
+// 注：「只换 key、不换出口」这条策略已随 CMP-130 撤销（403 现在也换出口，
+// 见 TestFreeTier403RotatesExitOrFallsBackToDirect）。出口真正连通后的端到端行为
+// 由假上游金丝雀按出口判 403/200 覆盖 —— 单测里 switch 模式会把请求交给
+// SOCKS5 dialer，假上游够不着。
 
 // TestHasNewerVersion 钉住 tag 归一化：CI 注入的 version 与 GitHub tag_name 都是 tag，
 // 但只要有任一侧漏了 "v" 前缀，versionNumbers 逐段只吃数字字符就会把 "v1.0.4" 读成
