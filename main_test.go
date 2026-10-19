@@ -1646,3 +1646,57 @@ func (c *closeNotifyReader) Close() error {
 	c.once.Do(func() { close(c.closed) })
 	return nil
 }
+
+// TestShape403DoesNotRotateExitOrRetry（CMP-130 独立验收·反向用例）：
+// 非 FreeTierError 签名的 403（形状类/其它类）必须单发透传：不重试、不换 key、
+// 不触发任何出口动作。只有 403+FreeTierError 才允许进 rotateSocks5OnFreeTier403 ——
+// 这是 CMP-109 结论（换出口救不了非出口类 403）的保护性反例。
+func TestShape403DoesNotRotateExitOrRetry(t *testing.T) {
+	quotaCase(t)
+	const shapeBody = `{"error": {"type": "permission_error", "message": "request shape rejected by upstream"}}`
+
+	// 判据层：形状类 403 不得被归入任何「换出口 / 进轮转分支」的通道。
+	if isFreeTier403(http.StatusForbidden, []byte(shapeBody)) {
+		t.Fatalf("形状类 403 不得被 isFreeTier403 命中")
+	}
+	if isRetryableQuotaUpstream(http.StatusForbidden, []byte(shapeBody)) {
+		t.Fatalf("形状类 403 不得被 isRetryableQuotaUpstream 命中（否则会进轮转分支）")
+	}
+
+	hits, restore := fakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(shapeBody))
+	})
+	defer restore()
+
+	body, status, _, err := callOpenCodeAPI(context.Background(),
+		map[string]any{"model": "space-bunny-free"}, "space-bunny-free")
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("形状类 403 应单发透传（不重试），实际打了 %d 次上游", got)
+	}
+	if status != http.StatusForbidden || err == nil {
+		t.Fatalf("应透传上游 403 + error，得到 status=%d err=%v", status, err)
+	}
+	if !strings.Contains(string(body), "shape rejected") {
+		t.Fatalf("应透传上游原始错误体，得到 %s", body)
+	}
+
+	// 流式入口同源：同一签名在 stream 循环里同样单发透传。
+	hits2, restore2 := fakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(shapeBody))
+	})
+	defer restore2()
+	rc, status2, _, _ := callOpenCodeAPIStream(context.Background(),
+		map[string]any{"model": "space-bunny-free"}, "space-bunny-free")
+	b2, _ := io.ReadAll(rc)
+	rc.Close()
+	if got := hits2.Load(); got != 1 {
+		t.Fatalf("流式入口的形状类 403 也应单发透传，实际 %d 次", got)
+	}
+	if status2 != http.StatusForbidden || !strings.Contains(string(b2), "shape rejected") {
+		t.Fatalf("流式入口应透传 403+原始体，得到 status=%d body=%s", status2, b2)
+	}
+}
