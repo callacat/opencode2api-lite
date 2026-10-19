@@ -299,11 +299,10 @@ final class Updater {
 
     private static HttpURLConnection open(Proxy px, String url, int connectTimeoutMs, int readTimeoutMs)
             throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        if (px != null) {
-            // 显式配了代理就一律走它：国内直连 GitHub 的三个域名都不通，系统代理多数人不会设。
-            c.setProxy(px);
-        }
+        // 代理要在 openConnection 时给：Android 的 URLConnection 没有 setProxy()
+        // （OpenJDK 有，Android SDK 里没有这个符号，CI 编译期就报 cannot find symbol）。
+        URL u = new URL(url);
+        HttpURLConnection c = (HttpURLConnection) (px == null ? u.openConnection() : u.openConnection(px));
         c.setConnectTimeout(connectTimeoutMs);
         c.setReadTimeout(readTimeoutMs);
         c.setInstanceFollowRedirects(true);
