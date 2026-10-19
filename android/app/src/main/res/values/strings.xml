@@ -34,4 +34,9 @@
     <string name="btn_start_desc">启动代理</string>
     <string name="btn_stop_desc">停止代理</string>
     <string name="btn_panel_desc">用系统浏览器打开管理面板</string>
+
+    <!-- CMP-159：自更新下载的出站代理 -->
+    <string name="update_proxy_hint">更新代理（可选）</string>
+    <string name="update_proxy_helper">下载更新走这个代理，如 192.168.1.150:30001 或 socks5://127.0.0.1:7890；留空跟随系统设置</string>
+    <string name="check_failed_hint">检查失败（网络受限时可在下方配置「更新代理」）</string>
 </resources>

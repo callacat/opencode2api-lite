@@ -19,6 +19,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.Proxy;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 
@@ -39,12 +40,14 @@ final class Updater {
 
     /** 查版本 / 拉清单一律 5s：卡面要求「断网/限流 5s 内降级」。 */
     private static final int TIMEOUT_MS = 5000;
-    /**
-     * 下载 APK 单独放宽：6MB 的包在真机（207）实测要一分钟以上，且末段会偶发停滞，
-     * 用 5s/30s 会把「慢」误判成「失败」。
-     */
+    /** 连接建立给 15s：国内这条链路 connect 本身会抖动，给太短会把「慢」误判成「失败」。 */
     private static final int DOWNLOAD_CONNECT_TIMEOUT_MS = 15000;
-    private static final int DOWNLOAD_READ_TIMEOUT_MS = 60000;
+    /**
+     * 读超时**不是总预算**，是「多久没收到任何一个字节就判死」（SO_TIMEOUT 每次 read 重置），
+     * 所以慢但在走的下载不受影响。CMP-153 实测直连时下载卡死在响应阶段，
+     * 60s×2 次重试 = 用户干等 150s 才看到失败；降到 20s 后最坏 ~2×(15+20)=70s。
+     */
+    private static final int DOWNLOAD_READ_TIMEOUT_MS = 20000;
     /** 下载失败重试次数（含首次）。 */
     private static final int DOWNLOAD_ATTEMPTS = 2;
     /** 清单文本很小，超过这个大小说明拿到的不是清单。 */
@@ -100,7 +103,7 @@ final class Updater {
         }
 
         try {
-            JSONObject rel = fetchLatestRelease();
+            JSONObject rel = fetchLatestRelease(proxy(ctx));
             populate(r, rel);
         } catch (Exception e) {
             r.state = State.FAILED;
@@ -167,8 +170,8 @@ final class Updater {
         decide(r);
     }
 
-    private static JSONObject fetchLatestRelease() throws Exception {
-        HttpURLConnection c = open(LATEST_API, TIMEOUT_MS, TIMEOUT_MS);
+    private static JSONObject fetchLatestRelease(Proxy px) throws Exception {
+        HttpURLConnection c = open(px, LATEST_API, TIMEOUT_MS, TIMEOUT_MS);
         try {
             int code = c.getResponseCode();
             if (code != 200) {
@@ -202,12 +205,13 @@ final class Updater {
             throw new IOException("无法创建下载目录 " + dir);
         }
         File apk = new File(dir, r.apkName);
+        Proxy px = proxy(ctx);
 
         IOException last = null;
         for (int attempt = 0; attempt < DOWNLOAD_ATTEMPTS; attempt++) {
             try {
-                downloadTo(r.apkUrl, apk, cb);
-                if (!Sha256.matches(fetchText(r.sumsUrl), r.apkName, apk)) {
+                downloadTo(px, r.apkUrl, apk, cb);
+                if (!Sha256.matches(fetchText(px, r.sumsUrl), r.apkName, apk)) {
                     throw new IOException("sha256 校验不通过（清单里没有该文件或哈希不符）");
                 }
                 return apk;
@@ -221,11 +225,29 @@ final class Updater {
                 }
             }
         }
-        throw last;
+        throw new IOException(reason(last), last);
     }
 
-    private static void downloadTo(String url, File dest, Progress cb) throws IOException {
-        HttpURLConnection c = open(url, DOWNLOAD_CONNECT_TIMEOUT_MS, DOWNLOAD_READ_TIMEOUT_MS);
+    /**
+     * Socket 层的英文异常翻成用户看得懂的一句（CMP-159 验收：无代理且 GitHub 不可达时
+     * UI 要给出「可读失败原因」）。拿不准的类型原样带出，不硬编。
+     */
+    private static String reason(IOException e) {
+        if (e instanceof java.net.SocketTimeoutException) {
+            // 国内最常见的形态：能连上、但字节一直不来，读超时判死。
+            return "下载超时（网络受限或被阻断，可在「更新代理」里填一个可用代理后重试）";
+        }
+        if (e instanceof java.net.UnknownHostException) {
+            return "域名解析失败：" + e.getMessage();
+        }
+        if (e instanceof java.net.ConnectException) {
+            return "连不上下载服务器：" + e.getMessage();
+        }
+        return e.getMessage() == null ? e.toString() : e.getMessage();
+    }
+
+    private static void downloadTo(Proxy px, String url, File dest, Progress cb) throws IOException {
+        HttpURLConnection c = open(px, url, DOWNLOAD_CONNECT_TIMEOUT_MS, DOWNLOAD_READ_TIMEOUT_MS);
         try {
             int code = c.getResponseCode();
             if (code != 200) {
@@ -255,8 +277,8 @@ final class Updater {
         }
     }
 
-    private static String fetchText(String url) throws IOException {
-        HttpURLConnection c = open(url, TIMEOUT_MS, TIMEOUT_MS);
+    private static String fetchText(Proxy px, String url) throws IOException {
+        HttpURLConnection c = open(px, url, TIMEOUT_MS, TIMEOUT_MS);
         try {
             if (c.getResponseCode() != 200) {
                 throw new IOException("拉取 sha256 清单返回 " + c.getResponseCode());
@@ -267,9 +289,20 @@ final class Updater {
         }
     }
 
-    private static HttpURLConnection open(String url, int connectTimeoutMs, int readTimeoutMs)
+    /**
+     * 用户在界面上配的更新代理（{@link ProxyService#KEY_UPDATE_PROXY}）。
+     * 空 / 解析不出来 = {@code null} = 跟随系统默认（含系统代理）。
+     */
+    private static Proxy proxy(Context ctx) {
+        return UpdateProxy.parse(ProxyService.prefs(ctx).getString(ProxyService.KEY_UPDATE_PROXY, ""));
+    }
+
+    private static HttpURLConnection open(Proxy px, String url, int connectTimeoutMs, int readTimeoutMs)
             throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        // 代理要在 openConnection 时给：Android 的 URLConnection 没有 setProxy()
+        // （OpenJDK 有，Android SDK 里没有这个符号，CI 编译期就报 cannot find symbol）。
+        URL u = new URL(url);
+        HttpURLConnection c = (HttpURLConnection) (px == null ? u.openConnection() : u.openConnection(px));
         c.setConnectTimeout(connectTimeoutMs);
         c.setReadTimeout(readTimeoutMs);
         c.setInstanceFollowRedirects(true);

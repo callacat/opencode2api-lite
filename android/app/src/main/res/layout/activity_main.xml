@@ -188,6 +188,27 @@
                     android:layout_height="48dp"
                     android:gravity="start|center_vertical"
                     android:text="@string/battery" />
+
+                <!--
+                  CMP-159：更新出站代理。放在配置卡最末，不动首屏已有的 端口/密码/LAN 排布
+                  （配置卡本来就快满，插在中间会把 LAN 开关挤出首屏）。
+                -->
+                <com.google.android.material.textfield.TextInputLayout
+                    android:id="@+id/update_proxy_layout"
+                    style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:hint="@string/update_proxy_hint"
+                    app:helperText="@string/update_proxy_helper">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/update_proxy"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:importantForAutofill="no"
+                        android:inputType="textUri" />
+                </com.google.android.material.textfield.TextInputLayout>
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
     </ScrollView>
