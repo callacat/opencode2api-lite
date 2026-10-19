@@ -418,6 +418,41 @@ func rotateSocks5OnRateLimit(ctx context.Context) {
 	log.Printf("%s[rate-limit proxy switch] upstream 429: %s -> %s", labelPrefix(ctx), socks5ExitLabelLocked(oldIdx, includeDirect), socks5ExitLabelLocked(nextIdx, includeDirect))
 }
 
+// rotateSocks5OnFreeTier403 处理「403 FreeTierError」这一路的出口动作。
+//
+// CMP-109 当年用「20819 与 20818 都 403」否证过「403 换出口有用」，CMP-128 推翻了它：
+// 那两条腿同属一个被整类拒绝的代理池，不是真对照；同刻同形状直连 7/7 全 200。
+// ⇒ 被拒的是**整类出口**时换 key 结构上无效（日志 k31→k35 五把 key 全 403 即此形态），
+// 这一路必须也换出口，否则永久 403 且不自愈。
+//
+// 两种模式分别处理：
+//   - switch 模式（__rate_limit_switch__ / __rate_limit_switch_no_direct__）：
+//     复用 429 的同一条轮转游标，下一发换到下一个出口。
+//   - 裸地址/其它模式：只有一条腿，无从轮转；该腿已被整类拒绝时直接**内存回落直连**
+//     —— 池里唯一还没试过的那条腿（CMP-128 实测直连 7/7 全 200）。只改内存不落
+//     config.json，重启即回原状，保留可回滚路径。
+func rotateSocks5OnFreeTier403(ctx context.Context, curLabel string) {
+	socks5Mu.Lock()
+	switch activeSocks5 {
+	case socks5RateLimitSwitch, socks5RateLimitSwitchNoDirect:
+		socks5Mu.Unlock()
+		rotateSocks5OnRateLimit(ctx)
+		return
+	}
+	if activeSocks5 == "" || curLabel == "direct" {
+		socks5Mu.Unlock()
+		return
+	}
+	rejected := activeSocks5
+	activeSocks5 = ""
+	closeHTTPClientIdle(socks5Client)
+	socks5Client = nil
+	socks5ClientKey = ""
+	socks5Mu.Unlock()
+	log.Printf("%s[free tier 403] 出口 %s 被整类拒绝，内存回落直连（不落 config.json，重启即回原状）",
+		labelPrefix(ctx), rejected)
+}
+
 // ======================== 随机 ID ========================
 
 // clientIP 从请求头提取客户端真实公网 IP。
@@ -902,12 +937,15 @@ func ocFreeTierHint() string {
 // 403 是硬失败、不是临时故障，且几道门任一失效都表现为它，故不受 debugMode 约束 ——
 // 生产默认不开 -debug，此前这类 403 在日志里完全不可见。
 // key_id 与 429 行对齐：判「是粘滞 key 撞上失效集合，还是这道门整体失效」全靠它。
-func logFreeTierRejection(ctx context.Context, modelID, keyID string, status int, body []byte) {
+// triedExits 是本轮真实打过的出口标签序列：只有一个元素 = 单出口（换 key 无望、换出口
+// 才有机会）；多个不同元素仍全 403 = 整类出口都被拒（CMP-128 形态）。事后判「整池被拒」
+// vs「单节点被拒」全看这一列。
+func logFreeTierRejection(ctx context.Context, modelID, keyID string, status int, body []byte, triedExits []string) {
 	if !isFreeTier403(status, body) {
 		return
 	}
-	log.Printf("%s[free tier rejected] model=%s key_id=%s status=%d body=%s hint=%s",
-		labelPrefix(ctx), modelID, keyID, status, string(body), ocFreeTierHint())
+	log.Printf("%s[free tier rejected] model=%s key_id=%s status=%d exits=%s body=%s hint=%s",
+		labelPrefix(ctx), modelID, keyID, status, strings.Join(triedExits, ">"), string(body), ocFreeTierHint())
 }
 
 // ocSessionRe 匹配 OpenCode 会话 id：ses_ + 12 位小写十六进制 + 14 位 [A-Za-z0-9]。
@@ -3154,6 +3192,8 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 	}
 	// 这个循环只服务两类重试：429 换出口/换凭据重试、Tor 电路故障 / 网络层错误重试。
 	// 5xx 已不再重试 —— 直接走下面的透传分支，把上游状态码与错误体原样交给客户端。
+	// triedExits 记录本轮真实打过的出口标签，供 [free tier rejected] 行判「整类出口被拒」。
+	var triedExits []string
 	for attempt := 0; ; {
 		up, keyID, err := buildOCRequest(ctx, bodyBytes)
 		if err != nil {
@@ -3164,6 +3204,7 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 		if err != nil {
 			return nil, http.StatusBadGateway, nil, err
 		}
+		triedExits = append(triedExits, selection.Label)
 		attempt++
 		resp, err := client.Do(up)
 		if err != nil {
@@ -3238,16 +3279,17 @@ func callOpenCodeAPI(ctx context.Context, bodyMap map[string]any, modelID string
 				log.Printf("%s[quota exhausted] model=%s attempt=%d retry_after=%q 不换 key/出口，透传上游 429", labelPrefix(ctx), modelID, attempt, retryAfter)
 				return lastBody, lastStatus, lastHeader, lastErr
 			}
-			// FreeTierError 是凭据级门，只换 key 不跟换出口：换出口/换会话已被
-			// CMP-109 的单变量实验证伪，跟着换只会白烧额度。
-			if !freeTier403 {
+			// 403 FreeTierError：换 key 之外还要换出口 —— 整类出口被拒时换 key 结构上无效。
+			if freeTier403 {
+				rotateSocks5OnFreeTier403(ctx, selection.Label)
+			} else {
 				rotateSocks5OnRateLimit(ctx)
 			}
 			if attempt < attempts {
 				continue
 			}
 		}
-		logFreeTierRejection(ctx, modelID, keyID, resp.StatusCode, errBody)
+		logFreeTierRejection(ctx, modelID, keyID, resp.StatusCode, errBody, triedExits)
 		// 没进任何重试分支的上游非 2xx 一律无条件记一行：此前只有 -debug 才可见，
 		// 而生产默认不开 -debug ⇒ 这些错误（400 `Model is unavailable`、各类 5xx、
 		// 上游换措辞后的新 4xx）在日志里完全不可观测。
@@ -3291,6 +3333,8 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 	}
 	// 这个循环只服务两类重试：429 换出口/换凭据重试、Tor 电路故障 / 网络层错误重试。
 	// 5xx 已不再重试 —— 直接走下面的透传分支，把上游状态码与错误体原样交给客户端。
+	// triedExits 与 callOpenCodeAPI 同源，供 [free tier rejected] 行判「整类出口被拒」。
+	var triedExits []string
 	for attempt := 0; ; {
 		up, keyID, err := buildOCRequest(ctx, bodyBytes)
 		if err != nil {
@@ -3300,6 +3344,7 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 		if err != nil {
 			return nil, http.StatusBadGateway, nil, err
 		}
+		triedExits = append(triedExits, selection.Label)
 		attempt++
 		resp, err := client.Do(up)
 		if err != nil {
@@ -3351,16 +3396,17 @@ func callOpenCodeAPIStream(ctx context.Context, bodyMap map[string]any, modelID 
 				log.Printf("%s[quota exhausted] model=%s attempt=%d retry_after=%q 不换 key/出口，透传上游 429", labelPrefix(ctx), modelID, attempt, retryAfter)
 				return io.NopCloser(bytes.NewReader(errBody)), resp.StatusCode, resp.Header.Clone(), nil
 			}
-			// FreeTierError 是凭据级门，只换 key 不跟换出口：换出口/换会话已被
-			// CMP-109 的单变量实验证伪，跟着换只会白烧额度。
-			if !freeTier403 {
+			// 与 callOpenCodeAPI 同源：403 FreeTierError 也换出口（见 rotateSocks5OnFreeTier403）。
+			if freeTier403 {
+				rotateSocks5OnFreeTier403(ctx, selection.Label)
+			} else {
 				rotateSocks5OnRateLimit(ctx)
 			}
 			if attempt < attempts {
 				continue
 			}
 		}
-		logFreeTierRejection(ctx, modelID, keyID, resp.StatusCode, errBody)
+		logFreeTierRejection(ctx, modelID, keyID, resp.StatusCode, errBody, triedExits)
 		// 同 callOpenCodeAPI：未进重试分支的上游非 2xx 无条件记一行，不再受 -debug 约束。
 		log.Printf("%s[upstream error] model=%s status=%d body=%s", labelPrefix(ctx), modelID, resp.StatusCode, string(errBody))
 		// 5xx（500/502/503/504…）不再重试：直接走下面的透传分支，把上游状态码与错误体原样交给客户端，
