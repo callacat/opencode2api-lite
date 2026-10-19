@@ -51,6 +51,11 @@ public class ProxyService extends Service {
     static final String KEY_ERROR = "error";
     /** 三档主题：system / light / dark（CMP-118，AppCompatDelegate 用）。 */
     static final String KEY_THEME = "theme";
+    /**
+     * 自更新下载走的代理（CMP-159），例如 `192.168.1.150:30001` 或 `socks5://127.0.0.1:7890`。
+     * 空 = 跟随系统默认。只作用于 Updater 的出站，不影响代理服务本身的上游。
+     */
+    static final String KEY_UPDATE_PROXY = "update_proxy";
 
     static final String STATE_IDLE = "idle";
     static final String STATE_STARTING = "starting";

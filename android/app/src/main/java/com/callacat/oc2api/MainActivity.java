@@ -59,6 +59,7 @@ public class MainActivity extends AppCompatActivity {
 
     private EditText portInput;
     private EditText passwordInput;
+    private EditText updateProxyInput;
     private TextView passwordWarn;
     private CompoundButton lanSwitch;
     private CompoundButton debugBox;
@@ -98,6 +99,7 @@ public class MainActivity extends AppCompatActivity {
 
         portInput = findViewById(R.id.port);
         passwordInput = findViewById(R.id.password);
+        updateProxyInput = findViewById(R.id.update_proxy);
         passwordWarn = findViewById(R.id.warn_password);
         lanSwitch = findViewById(R.id.lan);
         debugBox = findViewById(R.id.debug);
@@ -126,6 +128,26 @@ public class MainActivity extends AppCompatActivity {
 
         lanSwitch.setChecked(ProxyService.isLanMode(p));
         debugBox.setChecked(p.getBoolean(ProxyService.KEY_DEBUG, false));
+
+        // CMP-159：更新代理跟端口/密码不同，它不依赖「启动代理」，所以随手改随手存，
+        // 免得用户填完直接点「检查更新」却还是走旧值。
+        updateProxyInput.setText(p.getString(ProxyService.KEY_UPDATE_PROXY, ""));
+        updateProxyInput.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int a, int b, int c) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int a, int b, int c) {
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {
+                ProxyService.prefs(MainActivity.this).edit()
+                        .putString(ProxyService.KEY_UPDATE_PROXY, s == null ? "" : s.toString().trim())
+                        .apply();
+            }
+        });
 
         // LAN 开关的联动：勾上时密码还空着就当场补默认值。
         // 原先只在"点启动"那一刻才拦，用户看到的是"开关拨得上去"的表象。
@@ -520,7 +542,8 @@ public class MainActivity extends AppCompatActivity {
                 break;
             default:
                 // 卡面红线：断网/限流/解析失败只显示「检查失败」，不弹窗、不影响其它功能。
-                setUpdateText("检查失败");
+                // CMP-159：补一句可操作提示，否则用户只知道失败、不知道该动哪里。
+                setUpdateText(getString(R.string.check_failed_hint));
         }
     }
 
