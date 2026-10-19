@@ -22,6 +22,30 @@
 
 ### 修复
 
+- **403 `FreeTierError` 只换 key 不换出口，整类出口被拒时结构上救不回来**（CMP-130）。
+  被拒的对象是出口时，「只换 key」这条路原地打转：CMP-128 实测 mihomo 两个节点池
+  3/3 全 403、同刻同形状直连 7/7 全 200；现网日志 k31→k35 五把 key 全 403 即此形态
+  —— 判据是出口，不在 key。
+  - 新增 `rotateSocks5OnFreeTier403`：switch 模式复用 429 的轮转游标换腿；裸地址模式
+    只有一条腿、无从轮转，**内存回落直连**（不落 `config.json`、重启即回原状，保留
+    可回滚路径）。
+  - `[free tier rejected]` 行新增 `exits=` 字段：本轮真实打过的出口标签序列。单元素 =
+    单出口（换 key 无望）；多个不同元素仍全 403 = 整类出口被拒。
+  - 反向用例钉住边界：**非** `FreeTierError` 签名的 403 单发透传，不重试、不换 key、
+    不触发任何出口动作（CMP-109 结论的保护性反例）。
+
+- **上游黑洞时进程假死：HTTP 客户端零超时 + 无界重试**（CMP-119）。`Transport` 零值 =
+  无限等，补 `Dial` / `TLSHandshake` / `ResponseHeader` 三个超时；`fetchOCVersion` 的
+  `context.Background()` 被 `sync.Once` 焊死，启动期改用带超时 context；`client.Do`
+  错误分支从无条件 `continue` 改为有界重试 + 退避。
+
+- **SSE 客户端断开后 handler 不退出，fd 与 goroutine 漏到整机停摆**（CMP-119）。真机
+  症状是「端口仍 LISTEN + 进程还在 + CPU 静止 + 所有路由（含 `/health`）零响应」：
+  两个 SSE handler 都丢弃写错误，客户端（面板刷新/切页）已走仍一路读到上游 EOF，
+  上游流永不结束时就是永不返回，反复几次把 fd 吃光 → accept 停摆，curl 与裸 `nc`
+  都只见 000。OpenAI 与 Claude 两处循环改为写错误即置 `clientGone` 退出，由调用点的
+  defer 关闭上游 body。
+
 - **`:latest` 镜像里的版本号不再是 `dev`（CMP-157）**。`:latest` 改为只由 release tag 产出，
   main 分支改打 `:dev`（二进制版本号仍注入 `dev`，未改 `VERSION` 计算）。
   - 现场根因不是 tag 推送没带 `latest`：v1.2.1 的 tag run（39124414931）**确实推了**
@@ -112,6 +136,12 @@
 
 ### 测试
 
+- CMP-119 回归四条：`TestFetchModelsDoesNotHangForever`、
+  `TestHealthOutlivesBlackholedUpstream`、`TestUpstreamDialErrorRetryIsBounded`、
+  `TestClaudeStreamStopsWhenClientDisconnects`（最后一条去掉修复即 5.00s 超时失败，
+  已做变异验证）。
+- CMP-130 回归：`TestFreeTier403RotatesExitOrFallsBackToDirect` 三条子用例，加两入口
+  （`callOpenCodeAPI` / `callOpenCodeAPIStream`）「形状类 403 单发透传」反向断言。
 - `TestFreeTierToolsGate` 契约更新：核心五件必须补齐、同名桩替换为真实定义、
   未知名保留（新增 shell 桩替换断言）。
 - `TestIsRetryableQuotaUpstream` / `TestEndpointUnavailable403SamePath` /
