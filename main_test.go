@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -1827,5 +1828,213 @@ func TestShape403DoesNotRotateExitOrRetry(t *testing.T) {
 	}
 	if status2 != http.StatusForbidden || !strings.Contains(string(b2), "shape rejected") {
 		t.Fatalf("流式入口应透传 403+原始体，得到 status=%d body=%s", status2, b2)
+	}
+}
+
+// TestBaiduConnectDial 钉住百度 CONNECT 隧道的线协议与两处易错点：
+// 请求头逐字（Host/X-T5-Auth）、200 后响应缓冲里的剩余字节不能丢（后面紧跟 TLS 握手）、
+// 非 200 必须是 endpointError 而不是静默回落直连。
+func TestBaiduConnectDial(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	gotReq := make(chan string, 1)
+	gotPayload := make(chan string, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		br := bufio.NewReader(conn)
+		var req strings.Builder
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			req.WriteString(line)
+			if line == "\r\n" {
+				break
+			}
+		}
+		gotReq <- req.String()
+		// 头与首包一次写出：客户端若用 bufio 读完头后丢掉剩余字节，就收不到 pong。
+		conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\npong"))
+		buf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			serverErr <- err
+			return
+		}
+		gotPayload <- string(buf)
+		serverErr <- nil
+	}()
+
+	dial := baiduConnectDial(Socks5Proxy{
+		Addr:        "baidu://" + ln.Addr().String(),
+		Kind:        proxyKindBaidu,
+		Auth:        "test-auth-not-real",
+		ConnectHost: "",
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := dial(ctx, "tcp", "opencode.ai:443")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != "pong" {
+		t.Fatalf("响应头后的缓冲字节丢了: buf=%q err=%v", buf, err)
+	}
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	conn.Close()
+
+	req := <-gotReq
+	if !strings.HasPrefix(req, "CONNECT opencode.ai:443 HTTP/1.1\r\n") {
+		t.Errorf("请求行不对:\n%s", req)
+	}
+	if !strings.Contains(req, "\r\nHost: sptest.baidu.com\r\n") {
+		t.Errorf("缺默认 Host 头:\n%s", req)
+	}
+	if !strings.Contains(req, "\r\nX-T5-Auth: test-auth-not-real\r\n") {
+		t.Errorf("X-T5-Auth 未原值透传:\n%s", req)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	if got := <-gotPayload; got != "ping" {
+		t.Errorf("上行字节 = %q，期望 ping", got)
+	}
+}
+
+func TestBaiduConnectDialRejectsNon200(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		br := bufio.NewReader(conn)
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil || line == "\r\n" {
+				break
+			}
+		}
+		conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"))
+	}()
+
+	dial := baiduConnectDial(Socks5Proxy{Addr: "baidu://" + ln.Addr().String(), Kind: proxyKindBaidu, Auth: "x"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := dial(ctx, "tcp", "opencode.ai:443")
+	if err == nil {
+		conn.Close()
+		t.Fatal("403 必须报错，不得回落直连")
+	}
+	var epErr *socks5EndpointError
+	if !errors.As(err, &epErr) {
+		t.Fatalf("错误应可 As 到 *socks5EndpointError，得到 %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Errorf("错误信息应带状态行，得到: %v", err)
+	}
+}
+
+// TestSocks5ExitLabelBaidu 钉住巡检判据：日志 label 固定 baidu (baidu://<node>)，
+// 与面板 name 无关（name 带空格会让 oc2api-watch.py 的 addr 组为空 → 误判漂移）。
+func TestSocks5ExitLabelBaidu(t *testing.T) {
+	const addr = "baidu://cloudnproxy.baidu.com:443"
+	want := "baidu (" + addr + ")"
+	for _, name := range []string{"", "baidu", "我的 百度 隧道"} {
+		proxy := Socks5Proxy{Addr: addr, Kind: proxyKindBaidu, Name: name}
+		if got := socks5ProxyLabel(proxy); got != want {
+			t.Errorf("name=%q label=%q，期望 %q", name, got, want)
+		}
+	}
+
+	// 429 轮转日志走的是 socks5ExitLabelLocked，判定必须同源。
+	socks5Mu.Lock()
+	oldProxies := socks5Proxies
+	socks5Proxies = []Socks5Proxy{{Addr: addr, Kind: proxyKindBaidu, Name: "带 空格"}}
+	socks5Mu.Unlock()
+	defer func() {
+		socks5Mu.Lock()
+		socks5Proxies = oldProxies
+		socks5Mu.Unlock()
+	}()
+	if got := socks5ExitLabelLocked(0, false); got != want {
+		t.Errorf("socks5ExitLabelLocked=%q，期望 %q", got, want)
+	}
+
+	// SOCKS5 项行为不变：仍以 name 优先。
+	if got := socks5ProxyLabel(Socks5Proxy{Addr: "mihomo:20819", Name: "OC出口"}); got != "OC出口 (mihomo:20819)" {
+		t.Errorf("SOCKS5 label 被改坏: %q", got)
+	}
+}
+
+// TestConfigPostPreservesBaiduFields 钉住面板「GET 回来原样 POST」不会抹掉
+// kind/auth/connect_host —— CMP-161 同源问题，少了这三个字段一次保存就退化成
+// 拿 baidu:// 当 SOCKS5 地址去连。
+func TestConfigPostPreservesBaiduFields(t *testing.T) {
+	old := configPath
+	configPath = filepath.Join(t.TempDir(), "config.json")
+	defer func() {
+		configPath = old
+		applyConfig(AppConfig{Socks5Proxies: []Socks5Proxy{}, ActiveSocks5: ""})
+	}()
+
+	const addr = "baidu://cloudnproxy.baidu.com:443"
+	applyConfig(AppConfig{
+		Socks5Proxies: []Socks5Proxy{{
+			Addr:        addr,
+			Name:        "百度 隧道",
+			Kind:        proxyKindBaidu,
+			Auth:        "test-auth-not-real",
+			ConnectHost: "sptest.baidu.com",
+		}},
+		ActiveSocks5: addr,
+		OCSessionID:  testSession,
+	})
+
+	w := httptest.NewRecorder()
+	adminConfigHandler(w, httptest.NewRequest(http.MethodGet, "/api/config", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /api/config = %d", w.Code)
+	}
+	panelBody := w.Body.String()
+	w = httptest.NewRecorder()
+	adminConfigHandler(w, httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(panelBody)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST /api/config = %d: %s", w.Code, w.Body.String())
+	}
+
+	saved := loadConfig(configPath)
+	if len(saved.Socks5Proxies) != 1 {
+		t.Fatalf("落盘出口项数 = %d", len(saved.Socks5Proxies))
+	}
+	got := saved.Socks5Proxies[0]
+	if got.Kind != proxyKindBaidu || got.Auth != "test-auth-not-real" ||
+		got.ConnectHost != "sptest.baidu.com" || got.Addr != addr || got.Name != "百度 隧道" {
+		t.Errorf("面板保存后 baidu 字段丢失: %+v", got)
+	}
+	if saved.ActiveSocks5 != addr {
+		t.Errorf("active_socks5 = %q，期望 %q", saved.ActiveSocks5, addr)
 	}
 }

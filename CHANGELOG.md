@@ -48,6 +48,12 @@
 
 ### 新增
 
+- **新增 `baidu_connect` 出口（百度 CONNECT 隧道，CMP-197）**：出口列表新增第三种类型，面板可选（出口表新增「类型」下拉、Auth、Connect Host），配置持久化 `kind` / `auth` / `connect_host` 三个字段，`Kind` 省略即 SOCKS5、老配置行为与 `active_socks5` 完全不变。
+  - 拨号器 `baiduConnectDial()` 与 `socks5Dial()` 并列，只由 `newSocks5HTTPClient()` 一处分派；失败走 `endpointError()`，现有 429/403 自愈路径原样生效，CONNECT 非 200 报错带状态行、不静默回落直连。
+  - 日志 label 固定 `baidu (baidu://<node>)`，与面板 name 无关，`oc2api-watch.py` 的 `exit=` 判据零改动即可比对 `active_socks5`。
+  - 凭据 `auth` 只进 `config.json`，面板为 password 输入、日志/报错不打印。回归：`TestBaiduConnectDial`（线协议 + 响应缓冲 + 403）、`TestSocks5ExitLabelBaidu`、`TestConfigPostPreservesBaiduFields`（面板 GET→POST 不丢三字段）。
+  - 已知限制见 README：按目标域白名单放行、未压测速率/并发、`auth` 可能轮换、共享出口 IP 可能被上游判滥用流量。
+
 - **Android APK 形态（CMP-111）**：同仓新增 `android/` Gradle 子工程与 `.github/workflows/android-apk.yml`，把代理以静态二进制形式打进 APK，手机上本地跑，WebView 直接复用自带管理面板，无需服务器。
   - 代理源码**一行业务逻辑未动**；Android 侧只做「拉起进程 + 看守重启 + 显示面板」。
   - 打包路径：`CGO_ENABLED=1 GOOS=android GOARCH=arm64|amd64` NDK 交叉编译 → `jniLibs/<abi>/liboc2api.so`（lib 前缀 + .so 后缀，系统安装时才会解压到 `nativeLibraryDir`，那是 Android 10+ W^X 下少数允许 exec 的目录）。
