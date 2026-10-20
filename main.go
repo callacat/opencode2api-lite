@@ -23,7 +23,26 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	// 内嵌 IANA 时区库（约 +450KB）：alpine 运行时镜像与 Android 都没有
+	// /usr/share/zoneinfo，Go 的 time.LoadLocation 取不到数据会直接失败，
+	// time.Local 退化 UTC，日志时间整体漂 8 小时（CMP-190）。
+	_ "time/tzdata"
 )
+
+// defaultTimezone 是 TZ 未设置时的默认时区。
+const defaultTimezone = "Asia/Shanghai"
+
+// configureTimeLocal 决定进程的 time.Local：TZ 有值就按 TZ 走（显式覆盖），
+// 为空则默认上海。不依赖宿主/镜像是否装了 tzdata —— 时区数据已内嵌。
+func configureTimeLocal(tz string) {
+	if tz == "" {
+		tz = defaultTimezone
+	}
+	// 兼容 POSIX 的 ":Asia/Shanghai" 写法
+	if loc, err := time.LoadLocation(strings.TrimPrefix(tz, ":")); err == nil {
+		time.Local = loc
+	}
+}
 
 // newTransport 收口所有上游传输层的超时。CMP-119：这些 Transport 是字面量构造的，
 // 没写的字段全是零值，而零值在 net/http 里等于「无限等」—— 只要上游 accept 了连接
@@ -579,7 +598,10 @@ const (
 	//
 	// 兜底地板：随官方发版手工抬。它同时是「取到的版本比它还旧 ⇒ 丢弃」的地板，
 	// 陈旧 UA 会吃 426，从不主动发。fetchOCVersion() 拉的 npm 1.x 线不能当这个地板。
-	ocUABakedVersion = "2.0.32"
+	// 抬地板的触发条件：启动日志出现「[告警] UA 兜底地板已陈旧 baked=<地板> live=<新版本>」
+	// ⇒ 把 live 版本抄到这里、同步 CHANGELOG，并确认 main_test.go 的「兜底地板不低于
+	// 当前上游」断言已跟着抬（CMP-190）。
+	ocUABakedVersion = "2.1.1"
 )
 
 // ocUpdateAPIURL 是权威版本源：2.x 线只在这里发布（npm 分发件名 @opencode/cli）。
@@ -6679,6 +6701,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	configureTimeLocal(os.Getenv("TZ"))
 	flag.StringVar(&port, "port", "8000", "服务端口")
 	flag.StringVar(&listenAddr, "listen", "", "监听地址（留空 = 绑全网卡，与历史行为一致；写 127.0.0.1 只绑回环。写非回环地址必须同时设 -password）")
 	flag.StringVar(&configPath, "config", "config.json", "配置文件路径")

@@ -52,6 +52,9 @@ docker run -d --name opencode2api-lite \
 
 Compose 见 [`docker-compose.example.yml`](docker-compose.example.yml)；镜像支持 `linux/amd64` 与 `linux/arm64`。
 
+日志时间默认按 `Asia/Shanghai` 输出：时区库已内嵌进二进制（`time/tzdata`），镜像与 Android
+都不需要额外装 tzdata；需要别的时区时用 `TZ=UTC` 等环境变量覆盖即可。
+
 ### 验证
 
 ```bash
@@ -172,6 +175,12 @@ http://127.0.0.1:8000/v1/messages           # Anthropic 协议（Claude Code）
 系统进入 Doze 会掐掉应用的网络访问，代理就接不上上游。app 里有个
 **忽略电池优化** 按钮，装机后点一次；否则「关屏 30 分钟后仍可用」只在插着电时成立。
 
+### 滚动开发包
+
+合并到 main 会自动构建一次 APK 并覆盖预发布 [`android-dev`](../../releases/tag/android-dev)：
+`versionName` 为 `dev.<run_number>`（App 内可见），asset 名固定为 `oc2api-android-dev.apk`，
+release body 记录对应 `commit` 与构建时间。正式版仍只由 `v*` tag 产出，两者互不覆盖。
+
 ### 构建（新 ABI / 自定义）
 
 发布由 CI 完成：`.github/workflows/android-apk.yml` 先用 NDK
@@ -195,13 +204,17 @@ go vet ./... && go test ./...       # 检查 + 单测
 - [`build-release.yml`](.github/workflows/build-release.yml)：推送 `v*` tag → 5 平台二进制 + `sha256sums.txt` → GitHub Release（也支持手动触发验证）
 - [`docker-ghcr.yml`](.github/workflows/docker-ghcr.yml)：构建 `linux/amd64` + `linux/arm64` 镜像推送 GHCR（main → `dev`，tag → 语义化版本 + `latest`；
   `workflow_dispatch` 可传 `image_tag` 为任意分支构建可测镜像，留空则只构建不推送）
-- [`android-apk.yml`](.github/workflows/android-apk.yml)：推送 `v*` tag → NDK 交叉编译 + Gradle 出签名 APK → artifact（tag 时附到 Release）
+- [`android-apk.yml`](.github/workflows/android-apk.yml)：推送 `v*` tag → NDK 交叉编译 + Gradle 出签名 APK → artifact（tag 时附到 Release）；
+  合并到 main 也会自动出包（`versionName=dev.<run_number>`），滚动覆盖预发布 `android-dev`（不进正式 Release）
 
 ## 版本与变更记录
 
 - **变更明细**：[`CHANGELOG.md`](CHANGELOG.md)（按版本分节，本版改了什么看这里）
 - **产物与校验**：[Releases](../../releases)（各平台二进制、APK、`sha256sums.txt`）
 - **版本自证**：二进制版本号由 CI 按 tag 注入，`./opencode2api-lite-<version> -version` 打印的值应与 tag 一致
+- **UA 兜底地板**：`main.go` 里的 `ocUABakedVersion` 是官方更新服务不可达时的下限（低于上游 floor 会全量 426）。
+  启动日志出现 `[告警] UA 兜底地板已陈旧 baked=<地板> live=<新版本>` 时，把 live 版本抄进 `ocUABakedVersion`，
+  同步 CHANGELOG 并抬 `main_test.go` 里「兜底地板不低于当前上游」的断言——这条告警就是抬地板的唯一触发信号。
 
 ## 提交约定
 
