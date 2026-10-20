@@ -10,6 +10,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      image_tag:
+        description: '手动触发时的镜像 tag（留空 = 只构建不推送）'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -39,6 +44,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: 解析手动触发的镜像 tag
+        id: dispatch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RAW_TAG: ${{ inputs.image_tag }}
+        run: |
+          # 输入可能来自分支名：小写化，非 [a-z0-9_.-] 一律换成 -，去首尾符号，限 128 字符
+          TAG=$(printf '%s' "$RAW_TAG" | tr '[:upper:]' '[:lower:]' \
+            | sed -E 's#[^a-z0-9_.-]+#-#g; s#^[._-]+##; s#[._-]+$##' | cut -c1-128)
+          if [ -z "$RAW_TAG" ]; then
+            echo "::notice::image_tag 为空，本次只构建不推送（构建校验模式）"
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          elif [ -z "$TAG" ]; then
+            echo "::error::image_tag='$RAW_TAG' 清洗后为空，拒绝继续"
+            exit 1
+          else
+            echo "镜像 tag: $TAG"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: 提取 Docker 元数据
         id: meta
         uses: docker/metadata-action@v5
@@ -49,8 +75,10 @@ jobs:
             # latest 只能归 release tag：main 与 tag 常在同一秒推送、并发跑，
             # 谁后推完谁赢 latest（CMP-157 现场：main 慢 44s，把 latest 覆写成 dev 版）。
             # semver 那条经 flavor latest=auto 自动带 latest，无需另写 raw latest。
+            # workflow_dispatch 手动触发时用输入的 image_tag（已清洗），否则不产 tag → 不推送
             type=raw,value=dev,enable={{is_default_branch}}
             type=semver,pattern={{version}}
+            type=raw,value=${{ steps.dispatch.outputs.tag }},enable=${{ steps.dispatch.outputs.tag != '' }}
 
       - name: 计算镜像内版本号（-X main.version 注入）
         id: version
@@ -66,7 +94,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name != 'workflow_dispatch' || steps.dispatch.outputs.push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
