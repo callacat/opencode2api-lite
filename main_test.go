@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -35,6 +37,26 @@ func TestCompareVersion(t *testing.T) {
 		if got := compareVersion(c.a, c.b); got != c.want {
 			t.Errorf("compareVersion(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
 		}
+	}
+}
+
+// TestConfigureTimeLocal 钉住日志时区（CMP-190）：TZ 为空默认上海，
+// 显式 TZ 可覆盖；时区数据内嵌，不依赖运行环境是否装了 tzdata。
+func TestConfigureTimeLocal(t *testing.T) {
+	old := time.Local
+	t.Cleanup(func() { time.Local = old })
+
+	configureTimeLocal("")
+	if _, offset := time.Now().Zone(); offset != 8*3600 {
+		t.Fatalf("TZ 为空应默认 Asia/Shanghai（+8h），得到 offset %d", offset)
+	}
+	configureTimeLocal("UTC")
+	if _, offset := time.Now().Zone(); offset != 0 {
+		t.Fatalf("显式 TZ=UTC 应覆盖默认值，得到 offset %d", offset)
+	}
+	configureTimeLocal(":Asia/Shanghai")
+	if _, offset := time.Now().Zone(); offset != 8*3600 {
+		t.Fatalf("POSIX 写法 :Asia/Shanghai 应生效，得到 offset %d", offset)
 	}
 }
 
@@ -79,9 +101,9 @@ func TestAcceptUAVersion(t *testing.T) {
 	}{
 		{"", false},
 		{"1.19.3", false},        // npm 旧包线，低于地板
-		{"2.0.31", false},        // 低于地板
+		{"2.1.0", false},         // 低于地板
 		{ocUABakedVersion, true}, // 等于地板
-		{"2.0.33", true},
+		{"2.1.2", true},
 	}
 	for _, c := range cases {
 		if got := acceptUAVersion(c.ver); got != c.want {
@@ -99,7 +121,7 @@ func TestUAVersionFollowsUpdateAPI(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("mode") {
 		case "ok":
-			fmt.Fprint(w, `{"artifacts":[{"distribution":"npm","version":"2.0.33","active":true}]}`)
+			fmt.Fprint(w, `{"artifacts":[{"distribution":"npm","version":"2.1.2","active":true}]}`)
 		case "stale":
 			fmt.Fprint(w, `{"artifacts":[{"distribution":"npm","version":"1.19.3","active":true}]}`)
 		default:
@@ -122,7 +144,7 @@ func TestUAVersionFollowsUpdateAPI(t *testing.T) {
 			t.Fatalf("冷缓存应先回兜底地板，得到 %q", got)
 		}
 		refreshOCUA()
-		if got, want := ocClientUA(), "opencode/latest/2.0.33/cli"; got != want {
+		if got, want := ocClientUA(), "opencode/latest/2.1.2/cli"; got != want {
 			t.Fatalf("UA 应拼成 %q，得到 %q", want, got)
 		}
 	})
@@ -132,7 +154,7 @@ func TestUAVersionFollowsUpdateAPI(t *testing.T) {
 		refreshOCUA()
 		ocUpdateAPIURL = srv.URL + "/down"
 		refreshOCUA()
-		if got, want := ocClientUA(), "opencode/latest/2.0.33/cli"; got != want {
+		if got, want := ocClientUA(), "opencode/latest/2.1.2/cli"; got != want {
 			t.Fatalf("刷新失败应保留当前 UA，得到 %q", got)
 		}
 	})
@@ -142,20 +164,62 @@ func TestUAVersionFollowsUpdateAPI(t *testing.T) {
 		refreshOCUA()
 		ocUpdateAPIURL = srv.URL + "/stale"
 		refreshOCUA()
-		if got, want := ocClientUA(), "opencode/latest/2.0.33/cli"; got != want {
+		if got, want := ocClientUA(), "opencode/latest/2.1.2/cli"; got != want {
 			t.Fatalf("低于地板的版本应被丢弃，得到 %q", got)
 		}
 	})
 
 	t.Run("兜底地板不低于当前上游", func(t *testing.T) {
 		reset(t, "down")
-		if compareVersion(ocUABakedVersion, "2.0.32") < 0 {
-			t.Fatalf("兜底地板 %s 低于当前上游 2.0.32，取不到版本时会全量 426", ocUABakedVersion)
+		if compareVersion(ocUABakedVersion, "2.1.1") < 0 {
+			t.Fatalf("兜底地板 %s 低于当前上游 2.1.1，取不到版本时会全量 426", ocUABakedVersion)
 		}
 		if got, want := ocClientUA(), buildOCUA(ocUABakedVersion); got != want {
 			t.Fatalf("冷启动兜底 UA 应为 %q，得到 %q", want, got)
 		}
 	})
+}
+
+// TestUAFloorStaleWarning 钉住「地板落后 live 必须告警」：抬地板是一次性动作，
+// 若官方更新服务给出更高版本而日志沉默，地板就会静默腐烂（CMP-190）。
+// 假上游返回 live > 地板 ⇒ 必须出现告警；live == 地板 ⇒ 不许出现。
+func TestUAFloorStaleWarning(t *testing.T) {
+	ocOnce.Do(func() {}) // 挡掉 initOCSession 里的真实外网探测
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("mode") {
+		case "newer":
+			fmt.Fprintf(w, `{"artifacts":[{"distribution":"npm","version":"2.1.2","active":true}]}`)
+		default:
+			fmt.Fprintf(w, `{"artifacts":[{"distribution":"npm","version":"%s","active":true}]}`, ocUABakedVersion)
+		}
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	oldOut := log.Writer()
+	oldURL := ocUpdateAPIURL
+	log.SetOutput(&buf)
+	t.Cleanup(func() {
+		log.SetOutput(oldOut)
+		ocUpdateAPIURL = oldURL
+		ocUAValue = atomic.Value{}
+	})
+
+	ocUpdateAPIURL = srv.URL + "/cli?mode=newer"
+	ocUAValue = atomic.Value{}
+	refreshOCUA()
+	if !strings.Contains(buf.String(), "UA 兜底地板已陈旧") {
+		t.Fatalf("live 版本高于地板时必须告警，实际日志: %q", buf.String())
+	}
+
+	buf.Reset()
+	ocUpdateAPIURL = srv.URL + "/cli?mode=same"
+	ocUAValue = atomic.Value{}
+	refreshOCUA()
+	if strings.Contains(buf.String(), "UA 兜底地板已陈旧") {
+		t.Fatalf("live 版本等于地板时不应告警，实际日志: %q", buf.String())
+	}
 }
 
 // TestOCSessionInjection 钉住会话选取契约：配了 oc_session_id 就用配置值

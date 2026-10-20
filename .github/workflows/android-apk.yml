@@ -1,8 +1,8 @@
 # Android APK 构建与发布
 #
-# 触发：v* 标签推送 + 手动触发 + PR（限本工程相关路径）。
+# 触发：v* 标签推送（正式 Release）+ main 推送（滚动开发包）+ 手动触发 + PR（限本工程相关路径）。
 # 流程：go-so（NDK 交叉编译 liboc2api.so × 2 ABI）→ apk（Gradle assembleRelease + 签名 + 验签）
-#       → 产物上传 artifact；tag 推送时附到同名 Release。
+#       → 产物上传 artifact；tag 推送时附到同名 Release，main 推送时覆盖预发布 android-dev。
 #
 # 为什么不用 ./gradlew：仓库里不放 gradle-wrapper.jar（二进制），改由 setup-gradle 提供
 # 固定版本的 gradle 命令。本地要跑请自行装 Gradle 8.9（且本机按 D7 约束不许跑构建）。
@@ -12,6 +12,16 @@ on:
   push:
     tags:
       - 'v*'
+    # main 合并即出滚动开发包（CMP-190）：paths 与 PR 过滤一致，
+    # 纯文档提交不触发全量 NDK 构建。
+    branches:
+      - main
+    paths:
+      - 'android/**'
+      - 'main.go'
+      - 'main_test.go'
+      - 'go.mod'
+      - '.github/workflows/android-apk.yml'
   # PR 上跑一遍：workflow_dispatch 只认默认分支上的工作流文件，
   # 分支上的改动没法直接手动触发，PR 是唯一能在合并前拿到构建结论的入口。
   pull_request:
@@ -82,9 +92,15 @@ jobs:
       - name: 交叉编译 liboc2api.so（arm64-v8a + x86_64）
         run: |
           set -euo pipefail
+          # 版本与 apk job 同一规则：tag → 去掉 v 的正式版；main → dev.<run_number>（可区分先后）；
+          # 其余（PR / 手动）→ dev。
           VERSION="${GITHUB_REF_NAME#v}"
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            VERSION="dev.${GITHUB_RUN_NUMBER}"
+          fi
           [ -z "$VERSION" ] && VERSION="dev"
           printf '%s' "$VERSION" | grep -Eq '^[0-9A-Za-z._-]+$' || VERSION="dev"
+          echo "cross-compile VERSION=${VERSION}"
 
           TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           [ -d "$TC" ] || { echo "找不到工具链目录 $TC"; ls "$ANDROID_NDK_HOME" || true; exit 1; }
@@ -175,10 +191,15 @@ jobs:
           done
           find android/app/src/main/jniLibs -type f -printf '%p %s bytes\n' | sort
 
-      - name: 解析版本号（单一来源 = git tag）
+      - name: 解析版本号（tag = 正式版；main = dev.<run_number>）
         run: |
           set -euo pipefail
+          # 与 go-so job 同一规则：tag 取去掉 v 的版本；main 用 dev.<run_number>
+          # （裸 dev 无法区分先后，且 versionCode 也得跟着涨）；PR/手动 = dev。
           VERSION="${GITHUB_REF_NAME#v}"
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            VERSION="dev.${GITHUB_RUN_NUMBER}"
+          fi
           [ -z "$VERSION" ] && VERSION="dev"
           printf '%s' "$VERSION" | grep -Eq '^[0-9A-Za-z._-]+$' || VERSION="dev"
           if printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -186,10 +207,17 @@ jobs:
           else
             CODE="${GITHUB_RUN_NUMBER:-1}"
           fi
+          # main 的滚动包用固定 asset 名，gh release upload --clobber 才覆盖得上同一份；
+          # 正式 Release 仍用带版本号的文件名（语义不变）。
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            APK_NAME="oc2api-android-dev.apk"
+          else
+            APK_NAME="oc2api-android-${VERSION}.apk"
+          fi
           echo "OC2API_VERSION=${VERSION}" >> "$GITHUB_ENV"
           echo "OC2API_VERSION_CODE=${CODE}" >> "$GITHUB_ENV"
-          echo "APK_NAME=oc2api-android-${VERSION}.apk" >> "$GITHUB_ENV"
-          echo "版本 versionName=${VERSION} versionCode=${CODE}"
+          echo "APK_NAME=${APK_NAME}" >> "$GITHUB_ENV"
+          echo "版本 versionName=${VERSION} versionCode=${CODE} apk=${APK_NAME}"
 
       - name: 准备 release keystore
         env:
@@ -265,7 +293,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: 附到 GitHub Release（仅 tag 推送）
+      - name: 附到 GitHub Release（仅 tag 推送，正式版语义不变）
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -274,3 +302,22 @@ jobs:
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --generate-notes
           gh release upload "$GITHUB_REF_NAME" dist/*.apk dist/sha256sums-android.txt --clobber
+
+      # main 合并即覆盖滚动预发布 android-dev：固定 asset 名 + --clobber，
+      # 下载地址永远指向"最近一次 main 构建"；不进正式 Release、不动任何 v* 标签。
+      - name: 发布滚动预发布 android-dev（仅 main 推送）
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG=android-dev
+          BODY="$(printf '滚动开发包（非正式版，随 main 每次合并覆盖）\n\ncommit: %s\n构建时间(UTC): %s\n版本: %s / versionCode %s\nrun: #%s' \
+            "$GITHUB_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$OC2API_VERSION" "$OC2API_VERSION_CODE" "$GITHUB_RUN_NUMBER")"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --prerelease --notes "$BODY"
+          else
+            gh release create "$TAG" --prerelease --title "Android 滚动开发包" \
+              --target "$GITHUB_SHA" --notes "$BODY"
+          fi
+          gh release upload "$TAG" "dist/${APK_NAME}" dist/sha256sums-android.txt --clobber

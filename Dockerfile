@@ -9,8 +9,11 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}"
 
 # ── runtime stage：无特权、无额外内核能力 ──
 FROM alpine:latest
-# 访问 opencode.ai / registry.npmjs.org 走 HTTPS，需要根证书
-RUN apk add --no-cache ca-certificates
+# 访问 opencode.ai / registry.npmjs.org 走 HTTPS，需要根证书；
+# tzdata 供镜像内的 date/日志工具取时区（Go 进程自身已内嵌 time/tzdata，见 main.go）
+RUN apk add --no-cache ca-certificates tzdata
+# 默认上海；docker run -e TZ=UTC 可覆盖（与代码里的默认值同一语义）
+ENV TZ=Asia/Shanghai
 COPY --from=build /out/opencode2api-lite /usr/local/bin/opencode2api-lite
 # config.json / stats.json 写在进程工作目录；compose 把 ./data 挂到这里即可持久化
 WORKDIR /data
