@@ -1098,7 +1098,10 @@ func (b configPostBody) merge(cfg *AppConfig) {
 		cfg.Socks5Proxies = *b.Socks5Proxies
 	}
 	if b.ActiveSocks5 == nil {
-		cfg.ActiveSocks5 = activeSocks5
+		// 403 整类被拒时的回落直连只改内存、不落盘（重启即回原状）。回填若取内存
+		// 现值，续命/面板保存就会把回落态整份写回 config.json，可回滚性随之失效，
+		// 所以这里一律以磁盘现值为准。
+		cfg.ActiveSocks5 = persistedActiveSocks5(activeSocks5)
 	} else {
 		cfg.ActiveSocks5 = *b.ActiveSocks5
 	}
@@ -1858,6 +1861,21 @@ func loadConfig(path string) AppConfig {
 	}
 	normalizeConfig(&cfg)
 	return cfg
+}
+
+// persistedActiveSocks5 返回 config.json 里持久化的出口配置。fallback 只在磁盘
+// 读不到/解析失败时兜底——那类部署下 saveConfig 同样写不进去，不会造成新的持久化。
+func persistedActiveSocks5(fallback string) string {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fallback
+	}
+	var cfg AppConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Printf("警告: 读取 config.json 的 active_socks5 失败: %v，沿用内存现值", err)
+		return fallback
+	}
+	return cfg.ActiveSocks5
 }
 
 func normalizeConfig(cfg *AppConfig) {
@@ -6076,7 +6094,9 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		configMu.RUnlock()
 		socks5Mu.RLock()
 		cfg.Socks5Proxies = socks5Proxies
-		cfg.ActiveSocks5 = activeSocks5
+		// 面板是「GET 回来原样 POST」的形态：回读必须是磁盘上的持久化值，
+		// 否则一次面板保存就会把内存里的 403 回落态钉进 config.json。
+		cfg.ActiveSocks5 = persistedActiveSocks5(activeSocks5)
 		socks5Mu.RUnlock()
 		// 凭据池原样回读：面板没有 key 管理 UI，但运营要能从 /api/config
 		// 确认线上池子的规模与策略（这也是本卡的验收判据之一）。
