@@ -2,49 +2,7 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [v1.2.5] - 2026-10-20
-
-### 修复
-
-- **容器日志时间漂 8 小时（CMP-190）**：runtime 镜像只有 `alpine + ca-certificates`、没有 zoneinfo，`TZ=Asia/Shanghai` 设了也无效，Go 的 `time.Local` 退回 UTC。二进制改为内嵌 `time/tzdata`，`main()` 启动时 `configureTimeLocal`：TZ 为空默认 `Asia/Shanghai`，TZ 有值按 TZ 走（含 POSIX `:` 前缀）；Dockerfile 同时补 `tzdata` 与 `ENV TZ=Asia/Shanghai`，容器内 `date` 也一致。单测 `TestConfigureTimeLocal` 钉住默认 / 覆盖 / 前缀三种情况。附带效果：每日统计的日切点随 `time.Local` 走（容器里原先是 UTC 00:00 ⇔ CST 08:00 切，现在按 CST 00:00 切）。
-
-- **Android 首装无默认模型别名，任何模型调用 403**（CMP-189）：随包 `android/app/src/main/assets/config.json`
-  的 `model_alias` 是空对象，而别名表为空即拒绝一切模型（`未在别名列表中配置`），
-  于是新装用户必须先开面板手填别名才能用。现按现网 oraarm 的实际取值预置 7 条
-  （`target_model` 带 `-free` 后缀），**只在首次启动落盘**，已装用户升级不覆盖其自有配置。
-
-### 变更
-
-- **UA 兜底地板 `2.0.32` → `2.1.1`（CMP-190）**：官方更新服务当前给 2.1.1（提卡时是 2.1.0，执行当晚上游又抬了一版），地板落后会打「UA 兜底地板已陈旧」告警。新增 `TestUAFloorStaleWarning` 钉住「live > 地板必须告警、live == 地板不告警」；README 写明抬地板触发条件（告警出现 ⇒ 抄 live 版本 + 同步 CHANGELOG 与断言）。
-
-### 新增
-
-- **合并到 main 自动出 Android 滚动开发包（CMP-190）**：`android-apk.yml` 增加 `push: branches: [main]`（`paths` 与 PR 过滤一致，纯文档提交不触发全量 NDK 构建）；main 构建 `versionName=dev.<run_number>`、`versionCode=<run_number>`，产物固定名 `oc2api-android-dev.apk` 覆盖预发布 `android-dev`（`prerelease=true`，release body 记 `commit` 与构建时间）。`v*` tag 路径语义不变：正式 Release 仍是 `oc2api-android-<version>.apk`，两者互不覆盖。
-
-## [v1.2.4] - 2026-10-20
-
-### 修复
-
-- **运行时「内存回落直连」会被续命落盘 / 面板保存写回 `config.json`**（CMP-161）。
-  403 整类被拒后回落直连只改内存，但 `configPostBody.merge()` 与 `GET /api/config`
-  都从内存现值回填 `active_socks5` 后整份 `saveConfig()`，于是「重启即回原状」在
-  「config 可写 + 配了 `oc_session_refresh_cmd`」的部署下失效——回落态跨重启存活。
-  现在两处回填都改读 **config.json 磁盘现值**（磁盘读不到/解析失败才沿用内存兜底），
-  运行时回落状态只留内存、不参与持久化。回归：`TestRuntimeFallbackNotPersistedByRefreshOrPanel`
-  同时钉住续命落盘与面板 GET→POST 两条旁路。
-
-### 构建 / CI
-
-- **`workflow_dispatch` 在非 main 分支推镜像失败**（CMP-160）：新增可选输入 `image_tag`
-  （小写、非法字符转 `-`、截 128 字符），留空则只构建不推送并打 notice；main 推送
-  `:dev`、tag 推送 semver+latest 的语义未动。
-
-### Android
-
-- **自更新下载支持走代理**（CMP-159）：国网直连 GitHub 会卡死约 150s 后失败，Updater
-  改为按配置走代理并在失败时快速报错，不再干等。
-
-## [Unreleased]
+## [v1.3.0] - 2026-10-21
 
 ### 新增
 
@@ -202,6 +160,48 @@
   （CMP-129 起 `TestTransient403RetriesThenPassesThrough` / `TestTransient403RetriesStream`
   已按新行为改写为同名的 `TestEndpointUnavailable403SamePath` /
   `TestEndpointUnavailableStreamSamePath`：403 形态不再轮转，改走熔断快速失败回 503。）
+
+## [v1.2.5] - 2026-10-20
+
+### 修复
+
+- **容器日志时间漂 8 小时（CMP-190）**：runtime 镜像只有 `alpine + ca-certificates`、没有 zoneinfo，`TZ=Asia/Shanghai` 设了也无效，Go 的 `time.Local` 退回 UTC。二进制改为内嵌 `time/tzdata`，`main()` 启动时 `configureTimeLocal`：TZ 为空默认 `Asia/Shanghai`，TZ 有值按 TZ 走（含 POSIX `:` 前缀）；Dockerfile 同时补 `tzdata` 与 `ENV TZ=Asia/Shanghai`，容器内 `date` 也一致。单测 `TestConfigureTimeLocal` 钉住默认 / 覆盖 / 前缀三种情况。附带效果：每日统计的日切点随 `time.Local` 走（容器里原先是 UTC 00:00 ⇔ CST 08:00 切，现在按 CST 00:00 切）。
+
+- **Android 首装无默认模型别名，任何模型调用 403**（CMP-189）：随包 `android/app/src/main/assets/config.json`
+  的 `model_alias` 是空对象，而别名表为空即拒绝一切模型（`未在别名列表中配置`），
+  于是新装用户必须先开面板手填别名才能用。现按现网 oraarm 的实际取值预置 7 条
+  （`target_model` 带 `-free` 后缀），**只在首次启动落盘**，已装用户升级不覆盖其自有配置。
+
+### 变更
+
+- **UA 兜底地板 `2.0.32` → `2.1.1`（CMP-190）**：官方更新服务当前给 2.1.1（提卡时是 2.1.0，执行当晚上游又抬了一版），地板落后会打「UA 兜底地板已陈旧」告警。新增 `TestUAFloorStaleWarning` 钉住「live > 地板必须告警、live == 地板不告警」；README 写明抬地板触发条件（告警出现 ⇒ 抄 live 版本 + 同步 CHANGELOG 与断言）。
+
+### 新增
+
+- **合并到 main 自动出 Android 滚动开发包（CMP-190）**：`android-apk.yml` 增加 `push: branches: [main]`（`paths` 与 PR 过滤一致，纯文档提交不触发全量 NDK 构建）；main 构建 `versionName=dev.<run_number>`、`versionCode=<run_number>`，产物固定名 `oc2api-android-dev.apk` 覆盖预发布 `android-dev`（`prerelease=true`，release body 记 `commit` 与构建时间）。`v*` tag 路径语义不变：正式 Release 仍是 `oc2api-android-<version>.apk`，两者互不覆盖。
+
+## [v1.2.4] - 2026-10-20
+
+### 修复
+
+- **运行时「内存回落直连」会被续命落盘 / 面板保存写回 `config.json`**（CMP-161）。
+  403 整类被拒后回落直连只改内存，但 `configPostBody.merge()` 与 `GET /api/config`
+  都从内存现值回填 `active_socks5` 后整份 `saveConfig()`，于是「重启即回原状」在
+  「config 可写 + 配了 `oc_session_refresh_cmd`」的部署下失效——回落态跨重启存活。
+  现在两处回填都改读 **config.json 磁盘现值**（磁盘读不到/解析失败才沿用内存兜底），
+  运行时回落状态只留内存、不参与持久化。回归：`TestRuntimeFallbackNotPersistedByRefreshOrPanel`
+  同时钉住续命落盘与面板 GET→POST 两条旁路。
+
+### 构建 / CI
+
+- **`workflow_dispatch` 在非 main 分支推镜像失败**（CMP-160）：新增可选输入 `image_tag`
+  （小写、非法字符转 `-`、截 128 字符），留空则只构建不推送并打 notice；main 推送
+  `:dev`、tag 推送 semver+latest 的语义未动。
+
+### Android
+
+- **自更新下载支持走代理**（CMP-159）：国网直连 GitHub 会卡死约 150s 后失败，Updater
+  改为按配置走代理并在失败时快速报错，不再干等。
 
 ## [v1.0.4] - 2026-10-14
 
