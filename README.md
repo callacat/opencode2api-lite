@@ -37,7 +37,7 @@ https://opencode.ai/zen/v1/...     （可经 SOCKS5 出口）
 
 ```bash
 # 从 Releases 下载对应平台产物（校验见 sha256sums.txt）
-./opencode2api-lite-1.0.0-linux-amd64 -port 8000 -password your-password
+./opencode2api-lite-<version>-linux-amd64 -port 8000 -password <面板密码>
 ```
 
 ### Docker
@@ -193,8 +193,21 @@ go vet ./... && go test ./...       # 检查 + 单测
 发布由 GitHub Actions 完成：
 
 - [`build-release.yml`](.github/workflows/build-release.yml)：推送 `v*` tag → 5 平台二进制 + `sha256sums.txt` → GitHub Release（也支持手动触发验证）
-- [`docker-ghcr.yml`](.github/workflows/docker-ghcr.yml)：构建 `linux/amd64` + `linux/arm64` 镜像推送 GHCR（main → `latest`，tag → 语义化版本）
+- [`docker-ghcr.yml`](.github/workflows/docker-ghcr.yml)：构建 `linux/amd64` + `linux/arm64` 镜像推送 GHCR（main → `dev`，tag → 语义化版本 + `latest`；
+  `workflow_dispatch` 可传 `image_tag` 为任意分支构建可测镜像，留空则只构建不推送）
 - [`android-apk.yml`](.github/workflows/android-apk.yml)：推送 `v*` tag → NDK 交叉编译 + Gradle 出签名 APK → artifact（tag 时附到 Release）
+
+## 版本与变更记录
+
+- **变更明细**：[`CHANGELOG.md`](CHANGELOG.md)（按版本分节，本版改了什么看这里）
+- **产物与校验**：[Releases](../../releases)（各平台二进制、APK、`sha256sums.txt`）
+- **版本自证**：二进制版本号由 CI 按 tag 注入，`./opencode2api-lite-<version> -version` 打印的值应与 tag 一致
+
+## 提交约定
+
+- **行为面改动**（flag / 配置键 / HTTP 端点 / 默认值 / 依赖）必须在**同一 commit** 内同步更新 README 与 CHANGELOG；不许「先合并，文档以后再补」。
+- **发版时三处版本号同源**：CHANGELOG 段落、README 引用的产物名、Release notes —— 任一不一致视为发版未完成。
+- 判断口径：问一句「新人只看这个仓库，能不能跑起来、知不知道这版改了什么」；答否就是文档没跟上。
 
 ## License
 
