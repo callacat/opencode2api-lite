@@ -758,6 +758,71 @@ func TestConfigPostExplicitEmptyStillClears(t *testing.T) {
 	applyConfig(AppConfig{OCSessionID: testSession})
 }
 
+// TestRuntimeFallbackNotPersistedByRefreshOrPanel 钉住 CMP-161：403 整类被拒后的
+// 内存回落直连不得被「续命落盘」或「面板 GET→POST」旁路写进 config.json，否则
+// 「重启即回原状」失效，回落态会跨重启存活。
+func TestRuntimeFallbackNotPersistedByRefreshOrPanel(t *testing.T) {
+	old := configPath
+	configPath = filepath.Join(t.TempDir(), "config.json")
+	defer func() {
+		configPath = old
+		ocRefreshCmd = ""
+		applyConfig(AppConfig{Socks5Proxies: []Socks5Proxy{}, ActiveSocks5: ""})
+	}()
+
+	const exit = "mihomo:20819"
+	persisted := AppConfig{
+		Socks5Proxies: []Socks5Proxy{{Addr: exit, Name: "OC出口"}},
+		ActiveSocks5:  exit,
+		OCSessionID:   testSession,
+	}
+	if err := saveConfig(configPath, persisted); err != nil {
+		t.Fatalf("准备磁盘配置失败: %v", err)
+	}
+	applyConfig(persisted)
+	ocRefreshCmd = "echo 'message=created id=ses_0123456789abABCDEFGHIJKLMN'"
+
+	// 模拟 403 整类被拒：内存回落直连，磁盘保持原出口。
+	rotateSocks5OnFreeTier403(context.Background(), "OC出口 ("+exit+")")
+	socks5Mu.RLock()
+	active := activeSocks5
+	socks5Mu.RUnlock()
+	if active != "" {
+		t.Fatalf("回落应只改内存，activeSocks5=%q", active)
+	}
+
+	// 续命落盘不得顺带把回落态写进去。
+	if !refreshOCSessionOnce() {
+		t.Fatal("续命应成功")
+	}
+	if got := loadConfig(configPath).ActiveSocks5; got != exit {
+		t.Errorf("续命把回落态写进了 config.json：active_socks5=%q，期望 %q", got, exit)
+	}
+
+	// 面板「GET 回来原样 POST」：回读必须是磁盘值，保存后也不得变。
+	w := httptest.NewRecorder()
+	adminConfigHandler(w, httptest.NewRequest(http.MethodGet, "/api/config", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /api/config = %d", w.Code)
+	}
+	panelBody := w.Body.String()
+	var readBack map[string]any
+	if err := json.Unmarshal([]byte(panelBody), &readBack); err != nil {
+		t.Fatalf("GET /api/config 不是合法 JSON: %v", err)
+	}
+	if readBack["active_socks5"] != exit {
+		t.Errorf("面板回读应是磁盘值 %q，得到 %v", exit, readBack["active_socks5"])
+	}
+	w = httptest.NewRecorder()
+	adminConfigHandler(w, httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(panelBody)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST /api/config = %d: %s", w.Code, w.Body.String())
+	}
+	if got := loadConfig(configPath).ActiveSocks5; got != exit {
+		t.Errorf("面板保存把回落态写进了 config.json：active_socks5=%q，期望 %q", got, exit)
+	}
+}
+
 // TestKeyPoolExtraAttemptsBound 换凭据的重试次数要有上界：池大不等于可以无限试，
 // 每一次 429 重试都要等一个上游往返，放开会把首字节延迟拖到分钟级。
 func TestKeyPoolExtraAttemptsBound(t *testing.T) {
