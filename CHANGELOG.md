@@ -2,6 +2,29 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.2.4] - 2026-10-20
+
+### 修复
+
+- **运行时「内存回落直连」会被续命落盘 / 面板保存写回 `config.json`**（CMP-161）。
+  403 整类被拒后回落直连只改内存，但 `configPostBody.merge()` 与 `GET /api/config`
+  都从内存现值回填 `active_socks5` 后整份 `saveConfig()`，于是「重启即回原状」在
+  「config 可写 + 配了 `oc_session_refresh_cmd`」的部署下失效——回落态跨重启存活。
+  现在两处回填都改读 **config.json 磁盘现值**（磁盘读不到/解析失败才沿用内存兜底），
+  运行时回落状态只留内存、不参与持久化。回归：`TestRuntimeFallbackNotPersistedByRefreshOrPanel`
+  同时钉住续命落盘与面板 GET→POST 两条旁路。
+
+### 构建 / CI
+
+- **`workflow_dispatch` 在非 main 分支推镜像失败**（CMP-160）：新增可选输入 `image_tag`
+  （小写、非法字符转 `-`、截 128 字符），留空则只构建不推送并打 notice；main 推送
+  `:dev`、tag 推送 semver+latest 的语义未动。
+
+### Android
+
+- **自更新下载支持走代理**（CMP-159）：国网直连 GitHub 会卡死约 150s 后失败，Updater
+  改为按配置走代理并在失败时快速报错，不再干等。
+
 ## [Unreleased]
 
 ### 新增
