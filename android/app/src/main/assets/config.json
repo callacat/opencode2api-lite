@@ -1,5 +1,28 @@
 {
-  "model_alias": {},
+  "model_alias": {
+    "big-pickle": {
+      "target_model": "big-pickle",
+      "multimodal_model": "mimo-v2.6-flash-free"
+    },
+    "deepseek-v4.1-flash": {
+      "target_model": "deepseek-v4.1-flash-free"
+    },
+    "glm-5.3-flash": {
+      "target_model": "glm-5.3-flash-free"
+    },
+    "longcat-2.5-preview": {
+      "target_model": "longcat-2.5-preview-free"
+    },
+    "mimo-v2.6-flash": {
+      "target_model": "mimo-v2.6-flash-free"
+    },
+    "minimax-m3.1-flash": {
+      "target_model": "minimax-m3.1-flash-free"
+    },
+    "nemotron-3.5-super-vl": {
+      "target_model": "nemotron-3.5-super-vl-free"
+    }
+  },
   "reasoning_effort_map": {},
   "socks5_proxies": [],
   "active_socks5": ""
