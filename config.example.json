@@ -17,6 +17,13 @@
       "username": "",
       "password": "",
       "name": "local"
+    },
+    {
+      "addr": "baidu://cloudnproxy.baidu.com:443",
+      "name": "baidu",
+      "kind": "baidu_connect",
+      "auth": "",
+      "connect_host": "sptest.baidu.com"
     }
   ],
   "active_socks5": "",

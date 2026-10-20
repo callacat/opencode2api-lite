@@ -79,7 +79,19 @@ type Socks5Proxy struct {
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
 	Name     string `json:"name,omitempty"`
+
+	// Kind 是出口类型：""/"socks5" = SOCKS5，老配置行为不变；"baidu_connect" = 百度 CONNECT 隧道。
+	Kind string `json:"kind,omitempty"`
+	// Auth 是百度隧道的 X-T5-Auth 值（凭据，只进 config.json，不进仓库/日志）。
+	Auth string `json:"auth,omitempty"`
+	// ConnectHost 是百度隧道 CONNECT 的 Host 头，默认 sptest.baidu.com。
+	ConnectHost string `json:"connect_host,omitempty"`
 }
+
+const proxyKindBaidu = "baidu_connect"
+
+// baiduBootstrapHost 是百度隧道 CONNECT 的默认 Host 头（实测值，勿自创）。
+const baiduBootstrapHost = "sptest.baidu.com"
 
 // socks5EndpointError 表示 SOCKS5 服务本身无法连接、协商或认证。
 // 与 CONNECT 目标失败相区分：前者是代理节点不可用，后者是目标主机不可达。
@@ -240,11 +252,89 @@ func socks5Dial(proxy Socks5Proxy) func(ctx context.Context, network, addr strin
 	}
 }
 
+// bufferedConn 把 CONNECT 响应头读剩下的缓冲字节接回连接。
+// TLS 握手从客户端紧跟着开始，吞掉这几个字节就是随机握手失败。
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+// baiduNodeAddr 从 addr 取节点地址：去掉 baidu:// 前缀，缺省端口补 443。
+func baiduNodeAddr(addr string) (string, error) {
+	node := strings.TrimPrefix(strings.TrimSpace(addr), "baidu://")
+	if node == "" {
+		return "", errors.New("baidu node address is empty")
+	}
+	if _, _, err := net.SplitHostPort(node); err != nil {
+		node = net.JoinHostPort(strings.Trim(node, "[]"), "443")
+	}
+	return node, nil
+}
+
+// baiduConnectDial 走百度 CONNECT 隧道（代理不是 SOCKS5，协议照抄已验证的
+// x-tunnel dialBaiduTunnel 实现）。失败一律包 endpointError，复用现有自愈路径。
+func baiduConnectDial(proxy Socks5Proxy) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, target string) (net.Conn, error) {
+		node, err := baiduNodeAddr(proxy.Addr)
+		if err != nil {
+			return nil, endpointError("baidu node", err)
+		}
+		connectHost := strings.TrimSpace(proxy.ConnectHost)
+		if connectHost == "" {
+			connectHost = baiduBootstrapHost
+		}
+		// auth/connect_host 来自配置文件（可经面板写入），拼进请求头前挡掉换行注入。
+		for _, v := range []string{connectHost, proxy.Auth} {
+			if strings.ContainsAny(v, "\r\n") {
+				return nil, endpointError("baidu node", errors.New("auth/connect_host 含非法换行"))
+			}
+		}
+
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		conn, err := dialer.DialContext(ctx, "tcp", node)
+		if err != nil {
+			return nil, endpointError("connect to baidu node "+node, err)
+		}
+		deadline := time.Now().Add(15 * time.Second)
+		if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+			deadline = contextDeadline
+		}
+		conn.SetDeadline(deadline)
+
+		req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nX-T5-Auth: %s\r\n"+
+			"User-Agent: okhttp/3.11.0 Dalvik/2.1.0 (Linux; Build/RKQ1.200826.002) baiduboxapp/11.0.5.12 (Baidu; P1 11)\r\n"+
+			"Proxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n", target, connectHost, proxy.Auth)
+		if _, err := io.WriteString(conn, req); err != nil {
+			conn.Close()
+			return nil, endpointError("baidu CONNECT write", err)
+		}
+		br := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			conn.Close()
+			return nil, endpointError("read baidu CONNECT response", err)
+		}
+		// 不碰 resp.Body：隧道 200 响应没有 CL，Body 会一直读到 EOF（即连接关闭）。
+		if resp.StatusCode != http.StatusOK {
+			conn.Close()
+			return nil, endpointError("baidu CONNECT "+target, fmt.Errorf("状态行 %q", resp.Status))
+		}
+		conn.SetDeadline(time.Time{})
+		return &bufferedConn{Conn: conn, r: br}, nil
+	}
+}
+
 // newSocks5HTTPClient 构建走 SOCKS5 代理的 http.Client。
 // 不设 Client.Timeout，请求生命周期由调用方 context 控制；
 // 传输层超时与直连侧同源（见 newTransport）。
 func newSocks5HTTPClient(proxy Socks5Proxy) *http.Client {
-	return &http.Client{Transport: newTransport(socks5Dial(proxy))}
+	dial := socks5Dial(proxy)
+	if proxy.Kind == proxyKindBaidu {
+		dial = baiduConnectDial(proxy)
+	}
+	return &http.Client{Transport: newTransport(dial)}
 }
 
 func closeHTTPClientIdle(client *http.Client) {
@@ -279,10 +369,18 @@ var (
 )
 
 func socks5ProxyCacheKey(proxy Socks5Proxy) string {
-	return proxy.Addr + "\x00" + proxy.Username + "\x00" + proxy.Password
+	return proxy.Addr + "\x00" + proxy.Username + "\x00" + proxy.Password +
+		"\x00" + proxy.Kind + "\x00" + proxy.Auth + "\x00" + proxy.ConnectHost
 }
 
+// socks5ProxyLabel 是日志里的出口标识，同时是巡检脚本的判据：
+// oc2api-watch.py 的 exit 正则取 `exit=<name> (<addr>)` 的 addr 组与 active_socks5 对比。
+// 百度隧道固定 `baidu (baidu://<node>)`，与面板 name 无关 —— name 带空格会让 addr 组为空，
+// 巡检会误判漂移。
 func socks5ProxyLabel(proxy Socks5Proxy) string {
+	if proxy.Kind == proxyKindBaidu {
+		return "baidu (" + proxy.Addr + ")"
+	}
 	if proxy.Name != "" {
 		return proxy.Name + " (" + proxy.Addr + ")"
 	}
@@ -387,10 +485,7 @@ func socks5ExitLabelLocked(idx int, includeDirect bool) string {
 		return "direct"
 	}
 	proxy := socks5Proxies[proxyIdx]
-	if proxy.Name != "" {
-		return proxy.Name + " (" + proxy.Addr + ")"
-	}
-	return proxy.Addr
+	return socks5ProxyLabel(proxy)
 }
 
 func socks5RateLimitAttemptCount() int {
@@ -6483,10 +6578,10 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 </div>
 
 <div class="card full-row">
-<h2><span class="dot" style="background:var(--accent)"></span>SOCKS5 代理</h2>
+<h2><span class="dot" style="background:var(--accent)"></span>出口代理</h2>
 <div class="tbl-wrap">
 <table class="tbl" id="socks5Table">
-<thead><tr><th style="width:25%">名称</th><th style="width:28%">地址</th><th style="width:17%">用户名</th><th style="width:17%">密码</th><th style="width:13%"></th></tr></thead>
+<thead><tr><th style="width:13%">名称</th><th style="width:11%">类型</th><th style="width:20%">地址 / 节点</th><th style="width:10%">用户名</th><th style="width:10%">密码</th><th style="width:12%">Auth</th><th style="width:13%">Connect Host</th><th style="width:11%"></th></tr></thead>
 <tbody></tbody>
 </table>
 </div>
@@ -6506,6 +6601,7 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 </div>
 <div class="actions">
 <button class="btn btn-primary" onclick="addSocks5Row()">添加代理</button>
+<button class="btn btn-primary" onclick="addBaiduRow()">添加百度隧道</button>
 <button class="btn btn-success" onclick="saveConfig()">保存全部</button>
 </div>
 </div>
@@ -6531,10 +6627,11 @@ function renderEffortTable(){const list=document.getElementById('effortList');co
 function addEffortRow(){collectEfforts();const details=document.getElementById('reasoningEffortDetails');details.open=true;const list=document.getElementById('effortList');const empty=list.querySelector('.effort-empty');if(empty)empty.remove();list.insertAdjacentHTML('beforeend',effortRowHtml('',''));const rows=list.querySelectorAll('.effort-row');const input=rows.length?rows[rows.length-1].querySelector('[data-field="key"]'):null;if(input)input.focus()}
 function delEffort(btn){const row=btn.closest('.effort-row');if(row)row.remove();collectEfforts();renderEffortTable()}
 function collectEfforts(){const r={};document.querySelectorAll('#effortList .effort-row').forEach(row=>{const k=row.querySelector('[data-field="key"]'),v=row.querySelector('[data-field="val"]');if(k&&k.value.trim())r[k.value.trim()]=v?v.value.trim():''});effortData=r;updateEffortSummary();return r}
-function renderSocks5Table(){const tb=document.querySelector('#socks5Table tbody');if(!socks5Data.length){tb.innerHTML='<tr><td colspan="5" class="empty-hint">暂无代理配置</td></tr>';renderSocks5Select();return}tb.innerHTML=socks5Data.map((p,i)=>'<tr><td><input value="'+esc(p.name||'')+'" data-field="name"></td><td><input value="'+esc(p.addr)+'" data-field="addr" placeholder="例如: 127.0.0.1:1080"></td><td><input value="'+esc(p.username||'')+'" data-field="username"></td><td><input value="'+esc(p.password||'')+'" data-field="password" type="password"></td><td><button class="btn btn-danger" onclick="delSocks5('+i+')">删除</button></td></tr>').join('');renderSocks5Select()}
+function renderSocks5Table(){const tb=document.querySelector('#socks5Table tbody');if(!socks5Data.length){tb.innerHTML='<tr><td colspan="8" class="empty-hint">暂无代理配置</td></tr>';renderSocks5Select();return}tb.innerHTML=socks5Data.map((p,i)=>'<tr><td><input value="'+esc(p.name||'')+'" data-field="name"></td><td><select data-field="kind"><option value="">SOCKS5</option><option value="baidu_connect"'+(p.kind==='baidu_connect'?' selected':'')+'>百度隧道</option></select></td><td><input value="'+esc(p.addr||'')+'" data-field="addr" placeholder="127.0.0.1:1080 或 baidu://cloudnproxy.baidu.com:443"></td><td><input value="'+esc(p.username||'')+'" data-field="username"></td><td><input value="'+esc(p.password||'')+'" data-field="password" type="password"></td><td><input value="'+esc(p.auth||'')+'" data-field="auth" type="password" placeholder="X-T5-Auth"></td><td><input value="'+esc(p.connect_host||'')+'" data-field="connect_host" placeholder="sptest.baidu.com"></td><td><button class="btn btn-danger" onclick="delSocks5('+i+')">删除</button></td></tr>').join('');renderSocks5Select()}
 function addSocks5Row(){const tb=document.querySelector('#socks5Table tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';socks5Data.push({addr:'',name:''});renderSocks5Table()}
+function addBaiduRow(){const tb=document.querySelector('#socks5Table tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';socks5Data.push({addr:'baidu://cloudnproxy.baidu.com:443',name:'baidu',kind:'baidu_connect',connect_host:'sptest.baidu.com'});renderSocks5Table()}
 function delSocks5(i){socks5Data.splice(i,1);renderSocks5Table()}
-function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});socks5Data=r;return r}
+function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim()){const v=f=>(tr.querySelector('[data-field="'+f+'"]')||{}).value?.trim()||'';r.push({addr:a.value.trim(),name:v('name'),username:v('username'),password:v('password'),kind:v('kind'),auth:v('auth'),connect_host:v('connect_host')})}});socks5Data=r;return r}
 function renderSocks5Select(){const sel=document.getElementById('activeSocks5');const cur=sel.value;sel.innerHTML='<option value="">直连（不使用代理）</option>';socks5Data.forEach(p=>{if(p.addr){const label=p.name?p.name+' ('+p.addr+')':p.addr;const opt=document.createElement('option');opt.value=p.addr;opt.textContent=label;sel.appendChild(opt)}});if(socks5Data.length>=1){const opt=document.createElement('option');opt.value='__rate_limit_switch__';opt.textContent='限流切换（429 后切换，含直连）';sel.appendChild(opt);const opt2=document.createElement('option');opt2.value='__rate_limit_switch_no_direct__';opt2.textContent='限流切换（429 后切换，不含直连）';sel.appendChild(opt2)}if(socks5Data.length>=2){const opt=document.createElement('option');opt.value='__round_robin__';opt.textContent='轮询（每次请求切换）';sel.appendChild(opt)}sel.value=cur;if(!sel.value)sel.value='';}
 async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value,oc_session_id:document.getElementById('ocSessionId').value.trim(),oc_session_refresh_cmd:document.getElementById('ocSessionRefreshCmd').value.trim()};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}

@@ -27,6 +27,7 @@ https://opencode.ai/zen/v1/...     （可经 SOCKS5 出口）
 - **模型别名**：客户端模型名 → 上游 zen 模型名映射；未在别名表中配置的模型一律 403，防误用
 - **多模态**：别名可配 `multimodal_model`，带图片的请求自动切换上游模型
 - **SOCKS5 出口调度**：直连 / 固定代理 / 轮询 / 429 限速自动切换（含/不含直连两种模式）
+- **百度 CONNECT 隧道出口**：第三种出口类型 `baidu_connect`，国内网络经 `cloudnproxy.baidu.com` 的 CONNECT 隧道出网（面板可选，作保命通道）
 - **身份自动刷新**：启动时从 npm 拉取 opencode 最新版本号填入 UA（低于上游门槛自动抬升），每日统计重置时同步刷新 session / project
 - **管理面板**：模型别名、推理强度映射、出口代理在线编辑（保存即热加载）；用量统计按模型/按日；上游模型列表；会话手动刷新
 - **单文件零依赖**：仅 Go 标准库，`go build` 直接出二进制，交叉编译全平台
@@ -84,7 +85,14 @@ curl -s http://127.0.0.1:8000/v1/messages \
   },
   "reasoning_effort_map": { "big-pickle": "medium" },
   "socks5_proxies": [
-    { "addr": "127.0.0.1:7890", "name": "local" }
+    { "addr": "127.0.0.1:7890", "name": "local" },
+    {
+      "addr": "baidu://cloudnproxy.baidu.com:443",
+      "name": "baidu",
+      "kind": "baidu_connect",
+      "auth": "",
+      "connect_host": "sptest.baidu.com"
+    }
   ],
   "active_socks5": ""
 }
@@ -95,11 +103,21 @@ curl -s http://127.0.0.1:8000/v1/messages \
 | `model_alias` | 客户端模型名 → `target_model`（上游 zen 模型）。**未列入的一律 403**；`target_model` 留空时取别名同名；兼容旧写法 `"别名": "目标模型"` |
 | `multimodal_model` | 可选，带图片的请求改用该上游模型 |
 | `reasoning_effort_map` | 可选，按模型指定 reasoning effort |
-| `socks5_proxies` | 出口代理列表，每项 `addr` / `username` / `password` / `name` |
-| `active_socks5` | 出口选择：`""` 直连；`"127.0.0.1:7890"` 指定代理；`"__round_robin__"` 每请求轮询；`"__rate_limit_switch__"` 遇 429 轮换（含直连）；`"__rate_limit_switch_no_direct__"` 同上但只用代理 |
+| `socks5_proxies` | 出口列表。SOCKS5 项：`addr`（`host:port`）/ `username` / `password` / `name`；百度隧道项：`addr`（`baidu://host[:port]`，缺省端口 443）/ `name` / `kind` / `auth` / `connect_host` |
+| `kind` | 出口类型：省略或 `"socks5"` = SOCKS5（老配置行为不变）；`"baidu_connect"` = 百度 CONNECT 隧道 |
+| `auth` | 百度隧道的 `X-T5-Auth` 值。**凭据**：只写在 `config.json`，不要提交进仓库；面板里是 `type=password` 输入框，日志与报错不会打印它 |
+| `connect_host` | 百度隧道 CONNECT 的 `Host` 头，默认 `sptest.baidu.com` |
+| `active_socks5` | 出口选择：`""` 直连；`"127.0.0.1:7890"` 指定代理（百度项填 `"baidu://cloudnproxy.baidu.com:443"`）；`"__round_robin__"` 每请求轮询；`"__rate_limit_switch__"` 遇 429 轮换（含直连）；`"__rate_limit_switch_no_direct__"` 同上但只用代理 |
 | `oc_session_id` | 免费层必需的**真实会话 ID**（`ses_` 开头 + 26 位）。上游 2026-10 起校验会话存在性，编造的 `ses_*` 一律 403；未配置时代理返回 `503 OCSessionMissing`（而不是静默 403）。也可用环境变量 `OC_SESSION_ID` 注入。**注意：会话有效并不等于能过**——请求体的 `tools` 还必须同时含 `bash` 与 `read`（缺任一同样 403，由代理自动补齐，勿在客户端精简掉）。两道门都失效时，上游只回一个不区分来源的 `403 FreeTierError` |
 | `oc_session_refresh_cmd` | 可选。定期执行的命令，从其输出里解析新的 `ses_*` 自动续命（默认每 30 分钟，`OC_SESSION_REFRESH_INTERVAL` 可调）。上游无匿名会话注册端点，会话只能由 OpenCode 客户端产生，有效期未公开量化 |
 | `key_pool` | 可选，多凭据轮转。免费层限流维度是**（模型 × 凭据）**，单凭据的日预算就是整条链路的日预算，配上池子才能把总额度按凭据数放大。`enabled` 关闭 / `keys` 为空时鉴权回落到 `Bearer public`，行为与不配这一项完全一致。`strategy`：`sticky`（默认，按 `x-session-id` 粘住一条，中途不换）或 `round_robin`（每请求推进游标摊开负载）。`max_retries` 是凭据额度耗尽（429）后额外换几条重试，默认 4。`keys` 每条可写 `{"id","key","weight","enabled"}` 或直接写字符串；缺 `id` 按数组位置补 `k1..kN`，重复凭据加载时去重。凭据属敏感信息，不要提交进仓库 |
+
+### 百度 CONNECT 隧道的已知限制
+
+- **按目标域白名单放行**：隧道只对百度放行的域名可用，未放行的域会在 CONNECT 或 TLS 阶段失败。实测 `api.github.com` 曾 TLS 失败（国内 Android 自更新下载会失败），2026-10-21 复测又可通——白名单会变，**不要把它当稳定通道**。
+- **未压测速率/并发**：只作保命通道，出现主出口全挂时临时顶上；吞吐与并发能力未量化。
+- **`X-T5-Auth` 可能被封或轮换**：失效后隧道侧会回 403/407，代理按普通出口失败处理（走 429/403 自愈路径）；换值在面板改即可，不需要发版。
+- **上游可能按共享出口 IP 判「滥用流量」**：百度隧道出口是共享 IP，2026-10-21 实测 opencode.ai 对聊天接口返回 `403 FreeTierError ... abusive traffic from this IP`（同刻直连 200），隧道本身的 CONNECT/TLS/HTTP 均正常，被拦的是上游的免费层门禁。
 
 ## HTTP 接口
 
