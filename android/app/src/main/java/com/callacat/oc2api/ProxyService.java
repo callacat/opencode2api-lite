@@ -75,6 +75,16 @@ public class ProxyService extends Service {
     private volatile Process process;
     private Thread supervisor;
 
+    /**
+     * 服务实例是否活着。Activity 与服务同进程，进程被系统杀掉（覆盖安装 / force-stop / 回收）
+     * 后静态标志自然归 false —— 用来识别 prefs 里还写着 running、实际服务早没了的假状态。
+     */
+    private static volatile boolean alive;
+
+    static boolean isAlive() {
+        return alive;
+    }
+
     static SharedPreferences prefs(android.content.Context ctx) {
         return ctx.getSharedPreferences(PREFS, MODE_PRIVATE);
     }
@@ -113,6 +123,7 @@ public class ProxyService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        alive = true;
         if (!running) {
             running = true;
             setState(STATE_STARTING, null);
@@ -125,6 +136,7 @@ public class ProxyService extends Service {
 
     @Override
     public void onDestroy() {
+        alive = false;
         running = false;
         setState(STATE_IDLE, null);
         Process p = process;
@@ -148,11 +160,10 @@ public class ProxyService extends Service {
             long startedAt = System.currentTimeMillis();
             try {
                 launch();
-            } catch (IOException e) {
-                Log.e(TAG, "启动代理进程失败: " + e);
-                updateNotification("启动失败：" + e.getMessage());
-                // 按钮必须回到可点的"已停止"并给出原因，不能停在"启动中"假装还在跑。
-                setState(STATE_ERROR, "启动失败：" + e.getMessage());
+            } catch (Exception e) {
+                // 不只 IOException：pb.start() 还会抛 SecurityException 等运行时异常。
+                // 漏掉它们会静默杀死看守线程，界面就永久停在假的"运行中"（CMP-206）。
+                note("启动失败：" + e);
                 if (!sleepBackoff(attempt++)) {
                     return;
                 }
@@ -173,13 +184,19 @@ public class ProxyService extends Service {
             if (uptime >= HEALTHY_UPTIME_MS) {
                 attempt = 0;
             }
-            Log.w(TAG, "代理进程退出 code=" + code + "（存活 " + uptime + "ms），准备重启");
-            updateNotification("代理已退出（code=" + code + "），重启中…");
-            setState(STATE_ERROR, "进程已退出（code=" + code + "），正在自动重启");
+            note("代理进程退出（code=" + code + "，存活 " + uptime + "ms），正在自动重启");
             if (!sleepBackoff(attempt++)) {
                 return;
             }
         }
+    }
+
+    /** 失败/退出同时写 logcat、日志页、通知和 UI 状态，四处都不留空白（CMP-206）。 */
+    private void note(String msg) {
+        Log.w(TAG, msg);
+        LogBuffer.append(getFilesDir(), msg);
+        updateNotification(msg);
+        setState(STATE_ERROR, msg);
     }
 
     /** 返回 false 表示服务已被停掉，看守线程该退出了。 */
@@ -246,6 +263,8 @@ public class ProxyService extends Service {
 
         process = pb.start();
         Log.i(TAG, "代理进程已启动 listen=" + host + ":" + port + " cmd=" + cmd);
+        // 日志页也留一条（cmd 带面板密码，不写进落盘日志）。
+        LogBuffer.append(getFilesDir(), "代理进程已启动 listen=" + host + ":" + port);
         pump(process);
         updateNotification(lan
                 ? "局域网共享中（0.0.0.0:" + port + "）"

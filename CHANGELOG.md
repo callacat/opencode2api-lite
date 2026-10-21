@@ -2,6 +2,16 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- **Android：进程被杀后 App 仍显示「运行中」，实际没有任何服务**（CMP-206）。覆盖安装、force-stop、系统回收都会杀掉 app 进程，但 `SharedPreferences` 里的 `state=running` 会留下来；`MainActivity` 直接照它渲染，于是按钮是「停止」、状态写「运行中 http://127.0.0.1:8000/」，而 `ss -ltn` 无 8000、`ps` 无 `liboc2api.so`、`dumpsys activity services` 无服务 —— 面板所有请求自然失败，用户看到的是「保存失败 / 页面不刷新」。redroid（Android 14 / x86_64）上覆盖安装 5/5 轮稳定复现。
+  - 根因既不是「exec 失败被吞」（`pb.start()` 抛异常会被捕获、置 `error` 并按 `BACKOFF_MS` 重试），也不是安装器解压 jniLibs 的时序（覆盖安装后立即启动子进程 5/5 成功）。
+  - 新增 `ProxyService.isAlive()`（同进程静态标志）；`MainActivity` 启动时若 prefs 说在跑、服务却已不在，就按上次意图重新拉起服务，不再渲染假「运行中」。
+  - 看守线程改为捕获 `Exception`（原来只捕 `IOException`），运行时异常不再静默杀死看门狗；启动失败 / 子进程退出会同时写日志页（`LogBuffer`）、常驻通知与状态详情，日志区不再空白。
+  - 「打开面板」在代理未运行时提示「代理未运行，请先点启动」，不再打开必然连不上的页面。
+
 ## [v1.3.0] - 2026-10-21
 
 ### 新增
