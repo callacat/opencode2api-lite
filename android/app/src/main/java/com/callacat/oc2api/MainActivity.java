@@ -216,6 +216,7 @@ public class MainActivity extends AppCompatActivity {
             registerReceiver(installReceiver, filter);
         }
 
+        restoreIfNeeded();
         renderState();
 
         // 启动查一次（走 TTL 缓存，不阻塞界面、失败只留一行字）。
@@ -299,6 +300,34 @@ public class MainActivity extends AppCompatActivity {
 
     private boolean isRunning() {
         return ProxyService.STATE_RUNNING.equals(currentState());
+    }
+
+    /**
+     * 覆盖安装 / force-stop / 系统回收都会杀掉进程，但 prefs 里的 state=running 会留下来。
+     * 服务与本 Activity 同进程，isAlive() 能可靠区分「真在跑」和「假 running」：
+     * 后者按上次意图重新拉起服务，绝不让按钮停在假的「运行中」（CMP-206）。
+     */
+    private void restoreIfNeeded() {
+        String st = currentState();
+        boolean wanted = ProxyService.STATE_RUNNING.equals(st)
+                || ProxyService.STATE_STARTING.equals(st);
+        if (!wanted || ProxyService.isAlive()) {
+            return;
+        }
+        ProxyService.prefs(this).edit()
+                .putString(ProxyService.KEY_STATE, ProxyService.STATE_STARTING)
+                .putString(ProxyService.KEY_ERROR, "")
+                .apply();
+        startProxyService();
+    }
+
+    private void startProxyService() {
+        Intent svc = new Intent(this, ProxyService.class);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(svc);
+        } else {
+            startService(svc);
+        }
     }
 
     private void renderState() {
@@ -440,12 +469,7 @@ public class MainActivity extends AppCompatActivity {
                 .apply();
         renderState();
 
-        Intent svc = new Intent(this, ProxyService.class);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(svc);
-        } else {
-            startService(svc);
-        }
+        startProxyService();
     }
 
     private void stopProxy() {
@@ -459,6 +483,11 @@ public class MainActivity extends AppCompatActivity {
 
     /** 面板改由系统浏览器打开：用 127.0.0.1 而不是 localhost，避免 IPv6 解析歧义。 */
     private void openPanel() {
+        // 服务没在跑时打开面板只会得到浏览器的"无法连接"，先在这里说清楚（CMP-206）。
+        if (!ProxyService.STATE_RUNNING.equals(currentState()) || !ProxyService.isAlive()) {
+            toast("代理未运行，请先点「启动」");
+            return;
+        }
         String url = "http://127.0.0.1:" + currentPort() + "/";
         try {
             startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
