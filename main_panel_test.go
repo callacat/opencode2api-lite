@@ -75,4 +75,29 @@ func TestAdminPanelOfflineState(t *testing.T) {
 	if strings.Contains(tail, "setInterval(") {
 		t.Fatal("面板仍有裸 setInterval 轮询：失败时停不下来")
 	}
+	// 代理被系统杀掉后会被看门狗拉起来，所以停掉 5s 轮询的同时要留一条低频重试，
+	// 否则代理恢复了面板也不会自己接回去（CMP-215 真机定性后补的）。
+	if !strings.Contains(adminHTML, "function startRetry()") || !strings.Contains(adminHTML, "function stopRetry()") {
+		t.Fatal("面板缺少低频重试：停了 5s 轮询后代理恢复也接不回来")
+	}
+	if !strings.Contains(adminHTML, "setInterval(loadStats,15000)") {
+		t.Fatal("低频重试的间隔不是 15s")
+	}
+	// 「重启代理」入口：面板跑在系统浏览器里，代理卡死时只能唤起 App 去重启。
+	if !strings.Contains(adminHTML, `id="restartProxyBtn"`) {
+		t.Fatal("面板离线横幅里没有「重启代理」入口")
+	}
+	if !strings.Contains(adminHTML, "intent://#Intent;component=com.callacat.oc2api/.MainActivity;S.oc2api_restart=1;end") {
+		t.Fatal("「重启代理」入口没有指向 App 的重启 intent")
+	}
+}
+
+// 百度隧道的两个密码列挨着，用户会把面板密码填到 SOCKS5 密码列里
+// （真机就因此少了 X-T5-Auth，隧道必然 403）——列名与提示必须能一眼分清。
+func TestAdminPanelBaiduAuthColumn(t *testing.T) {
+	for _, want := range []string{"SOCKS5 密码", "百度 X-T5-Auth", "X-T5-Auth（必填）", "function renderSocks5Warn()"} {
+		if !strings.Contains(adminHTML, want) {
+			t.Fatalf("面板缺少 %q：百度隧道的 X-T5-Auth 与 SOCKS5 密码分不清", want)
+		}
+	}
 }

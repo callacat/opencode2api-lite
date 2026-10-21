@@ -11,6 +11,8 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.text.Editable;
@@ -52,6 +54,9 @@ import java.util.List;
 public class MainActivity extends AppCompatActivity {
 
     private static final int REQ_NOTIFICATIONS = 1001;
+
+    /** 面板 intent:// 唤起时带的 extra：值为 "1" 表示「重启代理」（CMP-215）。 */
+    static final String EXTRA_RESTART = "oc2api_restart";
 
     private static final String THEME_SYSTEM = "system";
     private static final String THEME_LIGHT = "light";
@@ -219,6 +224,7 @@ public class MainActivity extends AppCompatActivity {
         restoreIfNeeded();
         renderState();
         clearStaleInstallSession();
+        handleRestartIntent(getIntent());
 
         // 启动查一次（走 TTL 缓存，不阻塞界面、失败只留一行字）。
         checkUpdate(false);
@@ -471,6 +477,32 @@ public class MainActivity extends AppCompatActivity {
         renderState();
 
         startProxyService();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        // 面板的「重启代理」用 intent:// 唤起本 app（CMP-215）；singleTask 下走这里。
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleRestartIntent(intent);
+    }
+
+    /**
+     * 处理面板发来的「重启代理」请求（CMP-215）。
+     * 面板跑在系统浏览器里、代理进程可能正卡死（连不上），没法直接调本 app 的接口，
+     * 只能用 intent:// 把 app 唤起来由它来重启 —— 用户不用回 app 手点。
+     */
+    private void handleRestartIntent(Intent intent) {
+        if (intent == null || !"1".equals(intent.getStringExtra(EXTRA_RESTART))) {
+            return;
+        }
+        // 消费掉：否则旋转屏幕重建 Activity 时会再重启一次。
+        intent.removeExtra(EXTRA_RESTART);
+        toast("正在重启代理…");
+        stopProxy();
+        // stopService 是异步的，等它把服务拆干净再拉起来，否则新的 onStartCommand
+        // 会撞上「旧实例还 running」而被忽略。
+        new Handler(Looper.getMainLooper()).postDelayed(this::startProxy, 500);
     }
 
     private void stopProxy() {
