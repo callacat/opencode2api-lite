@@ -90,6 +90,18 @@ func TestAdminPanelOfflineState(t *testing.T) {
 	if !strings.Contains(adminHTML, "intent://#Intent;component=com.callacat.oc2api/.MainActivity;S.oc2api_restart=1;end") {
 		t.Fatal("「重启代理」入口没有指向 App 的重启 intent")
 	}
+	// 真机 PKG110 那种「连得上但不回包」的形态下，浏览器 fetch 不会自己 reject；
+	// 没有超时就会永远挂着，离线判定根本触发不了（运维在 CMP-216 实测指出）。
+	if !strings.Contains(adminHTML, "function fetchT(") || !strings.Contains(adminHTML, "AbortController") {
+		t.Fatal("面板没有带超时的 fetchT：服务不回包时请求会永远挂着")
+	}
+	if !strings.Contains(adminHTML, "await fetchT('/api/stats',8000)") {
+		t.Fatal("/api/stats 轮询没走 fetchT 超时")
+	}
+	// 所有面板请求都该走 fetchT，别再留裸 fetch（写操作更要防按钮一直转）。
+	if strings.Contains(adminHTML, "await fetch('/api/") {
+		t.Fatal("还有裸 fetch 打面板 API：服务不回包时会永远挂着")
+	}
 }
 
 // 百度隧道的两个密码列挨着，用户会把面板密码填到 SOCKS5 密码列里
