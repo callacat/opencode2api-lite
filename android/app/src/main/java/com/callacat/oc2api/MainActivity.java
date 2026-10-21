@@ -36,7 +36,6 @@ import com.google.android.material.color.MaterialColors;
 import java.io.File;
 import java.io.IOException;
 import java.util.List;
-import java.util.Locale;
 
 /**
  * 唯一的界面：状态 + 配置 + 运行日志（CMP-118）。
@@ -660,27 +659,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /**
-     * 把系统安装失败码/系统串翻成人话 + 下一步指引（CMP-215）。
-     * 系统原文是英文（"INSTALL FAILED ABORTED: User rejected permissions"），
-     * 用户看不懂也不知道该做什么。认不出的码保留原文，但补上系统码便于排查。
-     */
-    private static String installFailureText(int code, String msg) {
-        String raw = msg == null ? "" : msg.trim();
-        String u = raw.toUpperCase(Locale.ROOT);
-        if (u.contains("INSUFFICIENT_STORAGE")) {
-            return "存储空间不足，安装未完成。请清理手机存储后重试";
-        }
-        if (u.contains("VERSION_DOWNGRADE")) {
-            return "这是降级安装，系统已拒绝；本应用只支持升级安装";
-        }
-        if (u.contains("ABORTED") || u.contains("USER REJECTED")) {
-            return "系统未确认安装：可能是系统安装弹窗被拒绝，或还没授予「安装未知应用」权限"
-                    + "（设置 → 应用 → 特殊权限 → 安装未知应用），授权后再点一次「检查更新」";
-        }
-        return "安装未完成" + (raw.isEmpty() ? "" : "：" + raw) + "（系统码 status=" + code + "）";
-    }
-
     private void onInstallResult(Intent intent) {
         int sid = intent.getIntExtra(Updater.EXTRA_SESSION_ID, 0);
         int pending = ProxyService.prefs(this).getInt(ProxyService.KEY_INSTALL_SESSION, 0);
@@ -716,6 +694,6 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         String msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
-        setUpdateText(installFailureText(code, msg));
+        setUpdateText(InstallMessage.failureText(code, msg));
     }
 }
