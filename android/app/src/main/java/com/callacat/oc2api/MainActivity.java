@@ -8,6 +8,7 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
+import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -124,9 +125,9 @@ public class MainActivity extends AppCompatActivity {
         } else {
             passwordInput.setText(savedPw);
         }
-        updatePasswordWarn();
 
         lanSwitch.setChecked(ProxyService.isLanMode(p));
+        updatePasswordWarn();
         debugBox.setChecked(p.getBoolean(ProxyService.KEY_DEBUG, false));
 
         // CMP-159：更新代理跟端口/密码不同，它不依赖「启动代理」，所以随手改随手存，
@@ -154,9 +155,9 @@ public class MainActivity extends AppCompatActivity {
         lanSwitch.setOnCheckedChangeListener((btn, checked) -> {
             if (checked && currentPassword().isEmpty()) {
                 passwordInput.setText(getString(R.string.default_password));
-                updatePasswordWarn();
                 toast(getString(R.string.password_autofilled));
             }
+            updatePasswordWarn();
         });
         passwordInput.addTextChangedListener(new TextWatcher() {
             @Override
@@ -436,8 +437,12 @@ public class MainActivity extends AppCompatActivity {
 
     private void updatePasswordWarn() {
         // 默认密码随 APK 公开，局域网模式下等同没有保护 —— 当着用户的面说清楚。
+        // 局域网开启时升级成红色加粗的强提醒（CMP-210）：不拦启动，但风险要摆在明面上。
         boolean isDefault = getString(R.string.default_password).equals(currentPassword());
+        boolean lan = lanSwitch.isChecked();
         passwordWarn.setVisibility(isDefault ? View.VISIBLE : View.GONE);
+        passwordWarn.setText(lan ? R.string.password_warn_lan : R.string.password_warn);
+        passwordWarn.setTypeface(null, lan ? Typeface.BOLD : Typeface.NORMAL);
     }
 
     private void startProxy() {
@@ -458,6 +463,11 @@ public class MainActivity extends AppCompatActivity {
         if (lan && pw.isEmpty()) {
             toast(getString(R.string.need_password));
             return;
+        }
+        if (lan && getString(R.string.default_password).equals(pw)) {
+            // CMP-210：默认密码不拦启动（东哥 2026-10-21 拍板：做强提醒不做拒绝），
+            // 但每次点启动都要再敲一遍。
+            toast(getString(R.string.password_warn_lan_toast));
         }
 
         ProxyService.prefs(this).edit()

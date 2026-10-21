@@ -18,6 +18,9 @@
     <!-- 东哥拍板的默认面板密码。单独一个资源位，Java 侧不写死字符串。 -->
     <string name="default_password" translatable="false">123456</string>
     <string name="password_warn">当前是默认密码，局域网模式下等同没有保护，建议修改</string>
+    <!-- CMP-210：局域网 + 默认密码的强提醒（只提示，不拦启动） -->
+    <string name="password_warn_lan">局域网共享已开启，但面板密码仍是安装包里的默认值 —— 同网段任何设备都能打开面板并修改配置，请立即修改密码</string>
+    <string name="password_warn_lan_toast">警告：局域网共享正在使用默认密码，同网段设备可无鉴权访问面板。建议先改密码</string>
     <string name="password_autofilled">已自动填入默认密码，请按需修改</string>
     <string name="panel_open">打开面板</string>
     <string name="panel_no_browser">没有可用的浏览器</string>
