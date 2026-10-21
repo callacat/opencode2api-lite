@@ -2,6 +2,20 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- **面板：点主题按钮把「检查更新」按钮的文案改成 🌙/☀**（CMP-215）。主题按钮与「检查更新」按钮共用 `class="theme-toggle"`，而 `toggleTheme()` 用 `document.querySelector('.theme-toggle')` 取**第一个**匹配 —— HTML 里第一个是「检查更新」按钮，于是每次切主题改的都是它的文案（样式也一起串）。现在主题按钮独占 `id="themeBtn"`、按 id 定位，「检查更新」按钮改用普通面板按钮样式，两者不再互相影响。设备自带 Chrome 与桌面浏览器均已复现并验证。
+
+- **面板：点「退出」整页跳走，面板被"打没了"**（CMP-215）。「退出」原本是 `<form method="post" action="/logout"><button type="submit">`，点它 = 整页导航（设备浏览器上表现为 CDP 报 `Execution context was destroyed`），与真机「面板崩了、要多次刷新才能再打开」形状一致。现在改成 JS 提交 + 二次确认，退出后跳登录页；服务端 `/logout` 语义（POST 才真正注销会话）一字未动。
+
+- **面板：代理被系统杀掉时所有按钮都失败、页面看着像死了**（CMP-215）。面板每 5s 轮询 `/api/stats`，服务一挂所有 fetch 立刻失败，每个按钮都报「保存失败」，要反复刷新才能等到服务回来。现在连续 3 次失败就**停掉轮询**，显示「代理未运行或连接已断开」+「重新连接」按钮（手机端提示回 app 点「启动」），服务恢复后自动恢复轮询。
+
+- **Android：自更新失败把系统英文串直接甩给用户**（CMP-215）。`PackageInstaller.EXTRA_STATUS_MESSAGE` 的原文（如 `INSTALL FAILED ABORTED: User rejected permissions`）直接进版本行，用户看不懂也不知道该做什么。现在常见失败码翻成人话 + 下一步指引（存储不足 / 降级被拒 / 未授予「安装未知应用」权限并给出设置路径），认不出的码保留原文但补上「（系统码 status=N）」便于排查。
+
+- **Android：覆盖安装后第一次打开 App 挂着上一次的「安装未完成」**（CMP-215）。安装结果广播用的 PendingIntent 不是 one-shot 且从不取消，旧会话的结果可能迟到写进当前界面；同时代码里没有任何标记能区分「当前这次安装」与「上一次」。现在安装时记下会话 id，回调按会话 id 对号入座，对不上的一律不写界面；启动时还会清掉已经没有对应会话的标记 —— 全新安装（无历史会话）打开 App 不再显示「安装未完成」。
+
 ## [v1.3.1] - 2026-10-21
 
 ### 修复

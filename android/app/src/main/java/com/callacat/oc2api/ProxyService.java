@@ -56,6 +56,11 @@ public class ProxyService extends Service {
      * 空 = 跟随系统默认。只作用于 Updater 的出站，不影响代理服务本身的上游。
      */
     static final String KEY_UPDATE_PROXY = "update_proxy";
+    /**
+     * 当前进行中的 PackageInstaller 会话 id，0 = 没有安装在进行（CMP-215）。
+     * 系统回调的安装结果按它对号入座：旧会话迟到的结果不再写当前界面。
+     */
+    static final String KEY_INSTALL_SESSION = "install_session";
 
     static final String STATE_IDLE = "idle";
     static final String STATE_STARTING = "starting";

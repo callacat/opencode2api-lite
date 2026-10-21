@@ -36,6 +36,7 @@ import com.google.android.material.color.MaterialColors;
 import java.io.File;
 import java.io.IOException;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * 唯一的界面：状态 + 配置 + 运行日志（CMP-118）。
@@ -218,6 +219,7 @@ public class MainActivity extends AppCompatActivity {
 
         restoreIfNeeded();
         renderState();
+        clearStaleInstallSession();
 
         // 启动查一次（走 TTL 缓存，不阻塞界面、失败只留一行字）。
         checkUpdate(false);
@@ -628,7 +630,11 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         try {
-            Updater.install(this, apk);
+            int sessionId = Updater.install(this, apk);
+            // 记下会话号：系统回调按它对号入座，旧会话迟到的结果不写当前界面（CMP-215）。
+            ProxyService.prefs(this).edit()
+                    .putInt(ProxyService.KEY_INSTALL_SESSION, sessionId)
+                    .apply();
             setUpdateText("已交给系统安装器，请在系统弹窗里确认");
         } catch (IOException e) {
             busy = false;
@@ -637,7 +643,53 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * 启动时清掉已经没有对应会话的「待安装」标记（CMP-215）。
+     * PendingIntent 不是 one-shot 且从不取消，旧会话的结果可能迟到；
+     * 连不上会话就当没有安装在进行，那些结果一律不写界面。
+     */
+    private void clearStaleInstallSession() {
+        int sid = ProxyService.prefs(this).getInt(ProxyService.KEY_INSTALL_SESSION, 0);
+        if (sid <= 0) {
+            return;
+        }
+        PackageInstaller.SessionInfo si =
+                getPackageManager().getPackageInstaller().getSessionInfo(sid);
+        if (si == null) {
+            ProxyService.prefs(this).edit().remove(ProxyService.KEY_INSTALL_SESSION).apply();
+        }
+    }
+
+    /**
+     * 把系统安装失败码/系统串翻成人话 + 下一步指引（CMP-215）。
+     * 系统原文是英文（"INSTALL FAILED ABORTED: User rejected permissions"），
+     * 用户看不懂也不知道该做什么。认不出的码保留原文，但补上系统码便于排查。
+     */
+    private static String installFailureText(int code, String msg) {
+        String raw = msg == null ? "" : msg.trim();
+        String u = raw.toUpperCase(Locale.ROOT);
+        if (u.contains("INSUFFICIENT_STORAGE")) {
+            return "存储空间不足，安装未完成。请清理手机存储后重试";
+        }
+        if (u.contains("VERSION_DOWNGRADE")) {
+            return "这是降级安装，系统已拒绝；本应用只支持升级安装";
+        }
+        if (u.contains("ABORTED") || u.contains("USER REJECTED")) {
+            return "系统未确认安装：可能是系统安装弹窗被拒绝，或还没授予「安装未知应用」权限"
+                    + "（设置 → 应用 → 特殊权限 → 安装未知应用），授权后再点一次「检查更新」";
+        }
+        return "安装未完成" + (raw.isEmpty() ? "" : "：" + raw) + "（系统码 status=" + code + "）";
+    }
+
     private void onInstallResult(Intent intent) {
+        int sid = intent.getIntExtra(Updater.EXTRA_SESSION_ID, 0);
+        int pending = ProxyService.prefs(this).getInt(ProxyService.KEY_INSTALL_SESSION, 0);
+        if (pending == 0 || sid != pending) {
+            // 不是当前这次安装的结果：旧会话迟到、或压根没发起过安装。
+            // 真机踩过：覆盖安装后第一次打开 App，版本行挂着上一次的
+            // "INSTALL FAILED ABORTED: User rejected permissions"（CMP-215）。
+            return;
+        }
         busy = false;
         checkButton.setEnabled(true);
         int code = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
@@ -645,22 +697,25 @@ public class MainActivity extends AppCompatActivity {
             // 系统把「确认安装」这一步交回调用方：必须把它给的 Intent 起起来，
             // 否则用户看不到任何界面、会话也不会往下走。
             // （真机首测就卡在这里：EXTRA_STATUS = -1，被我当初当成失败处理了。）
+            // 这还是中间态：会话没结束，别清会话号，否则后面那条终态结果会被丢掉。
             Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT);
             setUpdateText("等待系统安装确认…");
             if (confirm != null) {
                 confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                 startActivity(confirm);
             } else {
-                setUpdateText("安装未完成：系统未返回确认界面");
+                setUpdateText("等待系统安装确认…（系统未返回确认界面）");
             }
             return;
         }
+        // 终态：这次会话结束了，之后再有同会话的结果也不认。
+        ProxyService.prefs(this).edit().remove(ProxyService.KEY_INSTALL_SESSION).apply();
         if (code == PackageInstaller.STATUS_SUCCESS) {
             setUpdateText("安装完成，重启后生效");
             toast("更新完成");
             return;
         }
         String msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
-        setUpdateText("安装未完成：" + (msg == null || msg.isEmpty() ? "status=" + code : msg));
+        setUpdateText(installFailureText(code, msg));
     }
 }
