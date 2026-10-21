@@ -222,6 +222,14 @@ public class ProxyService extends Service {
             throw new IOException("局域网模式未设面板密码，拒绝启动");
         }
 
+        // CMP-210：默认密码不拦启动，但日志与通知都要留痕，headless 启动也能看见。
+        boolean defaultPw = lan && getString(R.string.default_password).equals(pw);
+        if (defaultPw) {
+            String msg = "局域网共享仍在用默认面板密码，同网段设备可无鉴权访问面板";
+            Log.w(TAG, msg + "（CMP-210）");
+            LogBuffer.append(getFilesDir(), msg);
+        }
+
         File bin = new File(getApplicationInfo().nativeLibraryDir, BIN_NAME);
         if (!bin.isFile()) {
             throw new IOException("代理二进制缺失：" + bin);
@@ -267,7 +275,7 @@ public class ProxyService extends Service {
         LogBuffer.append(getFilesDir(), "代理进程已启动 listen=" + host + ":" + port);
         pump(process);
         updateNotification(lan
-                ? "局域网共享中（0.0.0.0:" + port + "）"
+                ? "局域网共享中（0.0.0.0:" + port + (defaultPw ? "，默认密码！" : "") + "）"
                 : "运行中 http://127.0.0.1:" + port + "/");
         // 子进程拉起来就算 running；真绑不上端口这类失败会在毫秒内退出，
         // 由 supervise() 的 exit 分支翻成 error，两边不重叠。
