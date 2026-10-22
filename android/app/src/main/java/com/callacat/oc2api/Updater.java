@@ -55,6 +55,13 @@ final class Updater {
 
     static final String ACTION_INSTALL_RESULT = "com.callacat.oc2api.INSTALL_RESULT";
     static final String EXTRA_INSTALL_STATUS = "status";
+    /**
+     * 回调广播里带的会话 id。系统回调时会保留我们放进去的 extra，
+     * 收方据此判断「这条结果是不是当前这次安装的」——
+     * PendingIntent 不是 one-shot 且从不取消，旧会话的结果可能迟到，
+     * 不对上号就会把上一次的失败写进当前界面（CMP-215）。
+     */
+    static final String EXTRA_SESSION_ID = "session_id";
 
     private Updater() {
     }
@@ -344,9 +351,11 @@ final class Updater {
 
     /**
      * 走系统安装器：把 APK 写进一个 PackageInstaller 会话后 commit，系统会弹安装确认界面。
-     * 结果经 {@link #ACTION_INSTALL_RESULT} 广播回 Activity。
+     * 结果经 {@link #ACTION_INSTALL_RESULT} 广播回 Activity，广播里带 {@link #EXTRA_SESSION_ID}。
+     *
+     * @return 会话 id；收方靠它把结果对回这次安装
      */
-    static void install(Context ctx, File apk) throws IOException {
+    static int install(Context ctx, File apk) throws IOException {
         PackageManager pm = ctx.getPackageManager();
         PackageInstaller installer = pm.getPackageInstaller();
         PackageInstaller.SessionParams params =
@@ -366,7 +375,9 @@ final class Updater {
             }
             PendingIntent cb = PendingIntent.getBroadcast(
                     ctx, id,
-                    new Intent(ACTION_INSTALL_RESULT).setPackage(ctx.getPackageName()),
+                    new Intent(ACTION_INSTALL_RESULT)
+                            .setPackage(ctx.getPackageName())
+                            .putExtra(EXTRA_SESSION_ID, id),
                     PendingIntent.FLAG_UPDATE_CURRENT
                             | (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                             ? PendingIntent.FLAG_MUTABLE : 0));
@@ -375,5 +386,6 @@ final class Updater {
             installer.abandonSession(id);
             throw e;
         }
+        return id;
     }
 }

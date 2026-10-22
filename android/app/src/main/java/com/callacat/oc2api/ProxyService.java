@@ -56,6 +56,11 @@ public class ProxyService extends Service {
      * 空 = 跟随系统默认。只作用于 Updater 的出站，不影响代理服务本身的上游。
      */
     static final String KEY_UPDATE_PROXY = "update_proxy";
+    /**
+     * 当前进行中的 PackageInstaller 会话 id，0 = 没有安装在进行（CMP-215）。
+     * 系统回调的安装结果按它对号入座：旧会话迟到的结果不再写当前界面。
+     */
+    static final String KEY_INSTALL_SESSION = "install_session";
 
     static final String STATE_IDLE = "idle";
     static final String STATE_STARTING = "starting";
@@ -70,6 +75,19 @@ public class ProxyService extends Service {
     private static final long[] BACKOFF_MS = {1000, 2000, 4000, 8000, 15000, 30000};
     /** 子进程活过这么久就认为这次启动是成功的，退避清零，避免长期把上限拉高。 */
     private static final long HEALTHY_UPTIME_MS = 30_000;
+
+    /**
+     * 探活自愈参数（CMP-215）。真机 PKG110 实测过一种「活着但不服务」的卡死：
+     * 进程在、端口 LISTEN、/health 却超时 —— 看门狗只看进程退出，覆盖不到，
+     * 于是面板所有请求挂住、用户看到「点任何按钮都崩 / 保存失败 / 很久打不开」。
+     * 这里定期探 /health，连续失败就判定卡死并杀掉子进程，让看守线程按退避重启。
+     * 判据（真机）：把子进程卡住后不手动点「停止→启动」，1 分钟内自愈。
+     */
+    private static final long PROBE_INTERVAL_MS = 5_000;
+    private static final long PROBE_TIMEOUT_MS = 3_000;
+    private static final int PROBE_FAIL_LIMIT = 3;
+    /** 启动宽限：子进程刚起来时端口还没 bind 上，这段时间探失败不算。 */
+    private static final long PROBE_GRACE_MS = 15_000;
 
     private volatile boolean running;
     private volatile Process process;
@@ -176,6 +194,8 @@ public class ProxyService extends Service {
             } catch (InterruptedException e) {
                 return;
             }
+            // 置空：探活线程靠「process == 我那一个」判断自己该不该退出。
+            process = null;
             if (!running) {
                 return;
             }
@@ -266,12 +286,72 @@ public class ProxyService extends Service {
         // 日志页也留一条（cmd 带面板密码，不写进落盘日志）。
         LogBuffer.append(getFilesDir(), "代理进程已启动 listen=" + host + ":" + port);
         pump(process);
+        startProbe(port);
         updateNotification(lan
                 ? "局域网共享中（0.0.0.0:" + port + "）"
                 : "运行中 http://127.0.0.1:" + port + "/");
         // 子进程拉起来就算 running；真绑不上端口这类失败会在毫秒内退出，
         // 由 supervise() 的 exit 分支翻成 error，两边不重叠。
         setState(STATE_RUNNING, null);
+    }
+
+    /**
+     * 探活自愈（CMP-215）：子进程可能「活着、端口在听、但不服务」——
+     * 真机 PKG110 实测：/proc/net/tcp 显示 127.0.0.1:8000 LISTEN，ps 里进程在，
+     * /health 却超时（连接被 accept 后无人处理）。看门狗只管进程退出，覆盖不到这种卡死。
+     * 这里定期探 /health，连续失败就判定卡死、杀掉子进程，让 supervise() 按退避重启。
+     */
+    private void startProbe(int port) {
+        final Process p = process;
+        Thread t = new Thread(() -> {
+            long start = System.currentTimeMillis();
+            int fail = 0;
+            while (running && process == p) {
+                try {
+                    Thread.sleep(PROBE_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                if (!running || process != p) {
+                    return;
+                }
+                if (System.currentTimeMillis() - start < PROBE_GRACE_MS) {
+                    continue;
+                }
+                if (probeHealthy(port)) {
+                    fail = 0;
+                    continue;
+                }
+                if (++fail < PROBE_FAIL_LIMIT) {
+                    continue;
+                }
+                fail = 0;
+                String msg = "探活连续失败：代理进程活着但不服务（/health 无响应），杀掉重启";
+                Log.w(TAG, msg);
+                LogBuffer.append(getFilesDir(), msg);
+                // 先 destroy()（SIGTERM）。真机那种卡死的进程可能连信号处理都不走了，
+                // 信号只是排队不生效 —— 等 2s 还不退就强杀，否则看门狗等不来 exit，
+                // 面板会一直挂着（用 SIGSTOP 冻住进程实测：SIGTERM 不生效，SIGKILL 才行）。
+                p.destroy();
+                try {
+                    if (!p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
+                        Log.w(TAG, "探活自愈：SIGTERM 未生效，强制结束进程");
+                        p.destroyForcibly();
+                    }
+                } catch (InterruptedException e) {
+                    p.destroyForcibly();
+                    return;
+                }
+                return;
+            }
+        }, "oc2api-probe");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** 探一次 /health：连不上、或超时内拿不到 200，都算不健康。 */
+    private boolean probeHealthy(int port) {
+        return HealthProbe.healthy(port, (int) PROBE_TIMEOUT_MS);
     }
 
     /** 把子进程 stdout/stderr 逐行转进 logcat 与日志环形缓冲（GUI 日志页读它）。 */

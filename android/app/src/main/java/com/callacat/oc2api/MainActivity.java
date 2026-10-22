@@ -11,6 +11,8 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.text.Editable;
@@ -52,6 +54,9 @@ import java.util.List;
 public class MainActivity extends AppCompatActivity {
 
     private static final int REQ_NOTIFICATIONS = 1001;
+
+    /** 面板 intent:// 唤起时带的 extra：值为 "1" 表示「重启代理」（CMP-215）。 */
+    static final String EXTRA_RESTART = "oc2api_restart";
 
     private static final String THEME_SYSTEM = "system";
     private static final String THEME_LIGHT = "light";
@@ -218,6 +223,8 @@ public class MainActivity extends AppCompatActivity {
 
         restoreIfNeeded();
         renderState();
+        clearStaleInstallSession();
+        handleRestartIntent(getIntent());
 
         // 启动查一次（走 TTL 缓存，不阻塞界面、失败只留一行字）。
         checkUpdate(false);
@@ -472,6 +479,32 @@ public class MainActivity extends AppCompatActivity {
         startProxyService();
     }
 
+    @Override
+    protected void onNewIntent(Intent intent) {
+        // 面板的「重启代理」用 intent:// 唤起本 app（CMP-215）；singleTask 下走这里。
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleRestartIntent(intent);
+    }
+
+    /**
+     * 处理面板发来的「重启代理」请求（CMP-215）。
+     * 面板跑在系统浏览器里、代理进程可能正卡死（连不上），没法直接调本 app 的接口，
+     * 只能用 intent:// 把 app 唤起来由它来重启 —— 用户不用回 app 手点。
+     */
+    private void handleRestartIntent(Intent intent) {
+        if (intent == null || !"1".equals(intent.getStringExtra(EXTRA_RESTART))) {
+            return;
+        }
+        // 消费掉：否则旋转屏幕重建 Activity 时会再重启一次。
+        intent.removeExtra(EXTRA_RESTART);
+        toast("正在重启代理…");
+        stopProxy();
+        // stopService 是异步的，等它把服务拆干净再拉起来，否则新的 onStartCommand
+        // 会撞上「旧实例还 running」而被忽略。
+        new Handler(Looper.getMainLooper()).postDelayed(this::startProxy, 500);
+    }
+
     private void stopProxy() {
         stopService(new Intent(this, ProxyService.class));
         ProxyService.prefs(this).edit()
@@ -628,7 +661,11 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         try {
-            Updater.install(this, apk);
+            int sessionId = Updater.install(this, apk);
+            // 记下会话号：系统回调按它对号入座，旧会话迟到的结果不写当前界面（CMP-215）。
+            ProxyService.prefs(this).edit()
+                    .putInt(ProxyService.KEY_INSTALL_SESSION, sessionId)
+                    .apply();
             setUpdateText("已交给系统安装器，请在系统弹窗里确认");
         } catch (IOException e) {
             busy = false;
@@ -637,7 +674,32 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * 启动时清掉已经没有对应会话的「待安装」标记（CMP-215）。
+     * PendingIntent 不是 one-shot 且从不取消，旧会话的结果可能迟到；
+     * 连不上会话就当没有安装在进行，那些结果一律不写界面。
+     */
+    private void clearStaleInstallSession() {
+        int sid = ProxyService.prefs(this).getInt(ProxyService.KEY_INSTALL_SESSION, 0);
+        if (sid <= 0) {
+            return;
+        }
+        PackageInstaller.SessionInfo si =
+                getPackageManager().getPackageInstaller().getSessionInfo(sid);
+        if (si == null) {
+            ProxyService.prefs(this).edit().remove(ProxyService.KEY_INSTALL_SESSION).apply();
+        }
+    }
+
     private void onInstallResult(Intent intent) {
+        int sid = intent.getIntExtra(Updater.EXTRA_SESSION_ID, 0);
+        int pending = ProxyService.prefs(this).getInt(ProxyService.KEY_INSTALL_SESSION, 0);
+        if (pending == 0 || sid != pending) {
+            // 不是当前这次安装的结果：旧会话迟到、或压根没发起过安装。
+            // 真机踩过：覆盖安装后第一次打开 App，版本行挂着上一次的
+            // "INSTALL FAILED ABORTED: User rejected permissions"（CMP-215）。
+            return;
+        }
         busy = false;
         checkButton.setEnabled(true);
         int code = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
@@ -645,22 +707,25 @@ public class MainActivity extends AppCompatActivity {
             // 系统把「确认安装」这一步交回调用方：必须把它给的 Intent 起起来，
             // 否则用户看不到任何界面、会话也不会往下走。
             // （真机首测就卡在这里：EXTRA_STATUS = -1，被我当初当成失败处理了。）
+            // 这还是中间态：会话没结束，别清会话号，否则后面那条终态结果会被丢掉。
             Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT);
             setUpdateText("等待系统安装确认…");
             if (confirm != null) {
                 confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                 startActivity(confirm);
             } else {
-                setUpdateText("安装未完成：系统未返回确认界面");
+                setUpdateText("等待系统安装确认…（系统未返回确认界面）");
             }
             return;
         }
+        // 终态：这次会话结束了，之后再有同会话的结果也不认。
+        ProxyService.prefs(this).edit().remove(ProxyService.KEY_INSTALL_SESSION).apply();
         if (code == PackageInstaller.STATUS_SUCCESS) {
             setUpdateText("安装完成，重启后生效");
             toast("更新完成");
             return;
         }
         String msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
-        setUpdateText("安装未完成：" + (msg == null || msg.isEmpty() ? "status=" + code : msg));
+        setUpdateText(InstallMessage.failureText(code, msg));
     }
 }
