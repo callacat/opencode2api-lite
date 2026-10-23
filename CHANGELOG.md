@@ -2,6 +2,12 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- **面板：代理没跑时点「保存全部」只报「保存失败: Failed to fetch」，用户以为配置写错了**（CMP-248）。保存的网络层失败（fetch 被拒 / 超时中断）现在明确提示「代理未运行或服务不可达，请回 App 确认代理已启动」；服务端返回非 2xx（如配置写盘失败）仍原样显示后端返回的具体错误，两类失败不再混成一句。
+
 ## [v1.3.2] - 2026-10-22
 
 ### 修复
