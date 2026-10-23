@@ -2,6 +2,12 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- **UA 兜底地板 `2.1.1` → `2.1.3`**（CMP-252，承接 CMP-213）。oraarm 现网 v1.3.1 启动日志报 `[告警] UA 兜底地板已陈旧 baked=2.1.1 live=2.1.2`；实施时（2026-10-23）现查官方更新服务 `https://opencode.ai/update/api/latest/cli`，live 已是 **2.1.3**（npm 分发件 `@opencode/cli`），地板一并抬到 2.1.3。它只是兜底地板（官方更新服务不可达时才用到），运行时 UA 仍跟随 live，出口语义不变。`main_test.go` 的「兜底地板不低于当前上游」断言同步抬到 2.1.3；假上游版本改用 `2.1.99`，下次抬地板不用再改这几条用例。
+
 ## [v1.3.2] - 2026-10-22
 
 ### 修复
