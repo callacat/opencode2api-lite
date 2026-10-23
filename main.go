@@ -696,7 +696,7 @@ const (
 	// 抬地板的触发条件：启动日志出现「[告警] UA 兜底地板已陈旧 baked=<地板> live=<新版本>」
 	// ⇒ 把 live 版本抄到这里、同步 CHANGELOG，并确认 main_test.go 的「兜底地板不低于
 	// 当前上游」断言已跟着抬（CMP-190）。
-	ocUABakedVersion = "2.1.1"
+	ocUABakedVersion = "2.1.3"
 )
 
 // ocUpdateAPIURL 是权威版本源：2.x 线只在这里发布（npm 分发件名 @opencode/cli）。
