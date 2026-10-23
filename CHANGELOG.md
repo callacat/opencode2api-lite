@@ -2,6 +2,16 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- **Android：后台被系统冻结的检测 + ColorOS 加白引导（提示 + 跳转入口）**（CMP-236，真机 OnePlus PKG110 / ColorOS / Android 15 定性）。ColorOS Hans 会把退到后台的 App 整个 uid 的 cgroup 冻结，App 自己的线程连同代理子进程 `liboc2api.so` 一起停摆 —— 内核仍 LISTEN、8000 端口在，但用户态不调度，面板 `/health` 超时、按钮全「保存失败」。
+  - 判据只用 App 内可观测的替代信号，**不读** `/sys/fs/cgroup` 下 uid 对应的 `cgroup.freeze`（非 root 读不到）：心跳断档（本进程长时间没被调度）+ 设备是醒着的（`uptimeMillis` 在涨，排除息屏/Doze 整机休眠）+ 断档落在一段后台期内。阈值 15s，与「连续 3 次探活失败」同一量级。判定逻辑抽成纯 Java 的 `FreezeDetector`，JVM 单测（`FreezeDetectorTest`，10 条）钉住「断档+醒着=冻结」「断档+睡着≠冻结」「没进后台≠冻结」三条分支。
+  - 面板离线横幅区分两种失败：**请求超时**（端口在但不回包）⇒ 明确提示「疑似被系统后台冻结」并给出 ColorOS 加白路径；拒连/其它 ⇒ 维持原有「代理未运行或无响应」。新增「去加白」按钮（`intent://` 唤起 App 打开应用详情页）。面板「保存失败」toast 在超时场景同样升级成冻结专属文案。
+  - App 侧（`ProxyService`）判出疑似冻结时记状态（`prefs`）+ 日志页留痕；用户把 App 切回前台时给原生提示，附「去加白」按钮跳到 `Settings.ACTION_APPLICATION_DETAILS_SETTINGS`（不硬编 ColorOS 私有 intent，各版本 action 不稳；文案指路到「设置 → 应用管理 → oc2api → 耗电管理 → 耗电行为控制 →「完全允许后台行为」→ 弹窗「允许」」，老马真机实测有效）。
+  - 配置区新增「冻结自检」入口：点一下即可看当前是否疑似被冻结 / 加白是否生效（上次退后台未检出冻结 = 加白已生效或未触发）。
+
 ## [v1.3.2] - 2026-10-22
 
 ### 修复

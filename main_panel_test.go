@@ -113,3 +113,25 @@ func TestAdminPanelBaiduAuthColumn(t *testing.T) {
 		}
 	}
 }
+
+// CMP-236：后台被冻结（ColorOS Hans 冻结 uid cgroup）时面板要给出明确提示 + 加白入口。
+func TestAdminPanelFreezeHint(t *testing.T) {
+	for _, want := range []string{"疑似被系统后台冻结", "耗电管理", "耗电行为控制", "完全允许后台行为", "去加白"} {
+		if !strings.Contains(adminHTML, want) {
+			t.Fatalf("面板缺少 %q：后台被冻结时没有给出 ColorOS 加白指引", want)
+		}
+	}
+	if !strings.Contains(adminHTML, `id="whitelistBtn"`) {
+		t.Fatal("面板没有「去加白」入口按钮")
+	}
+	if !strings.Contains(adminHTML, "intent://#Intent;component=com.callacat.oc2api/.MainActivity;S.oc2api_whitelist=1;end") {
+		t.Fatal("「去加白」入口没有指向 App 的 intent")
+	}
+	// 超时（端口在但不回包）才判「疑似被冻结」；拒连是另一回事，不能混。
+	if !strings.Contains(adminHTML, "freezeSuspect") && !strings.Contains(adminHTML, "请求超时") {
+		t.Fatal("面板没有把「请求超时」当成冻结信号")
+	}
+	if !strings.Contains(adminHTML, "保存失败：代理疑似被系统后台冻结") {
+		t.Fatal("保存失败没有升级成冻结专属文案")
+	}
+}

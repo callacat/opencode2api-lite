@@ -58,6 +58,15 @@ public class MainActivity extends AppCompatActivity {
     /** 面板 intent:// 唤起时带的 extra：值为 "1" 表示「重启代理」（CMP-215）。 */
     static final String EXTRA_RESTART = "oc2api_restart";
 
+    /** 面板 intent:// 唤起时带的 extra:值为 "1" 表示「去 ColorOS 加白」(CMP-236)。 */
+    static final String EXTRA_WHITELIST = "oc2api_whitelist";
+
+    /**
+     * 验收演练用(CMP-236):值为 "1" 时注入一次「疑似被冻结」。
+     * 真机加白后冻结不再复现,靠它验「提示 + 去加白」这条链路还在。
+     */
+    static final String EXTRA_FREEZE_TEST = "oc2api_freeze_test";
+
     private static final String THEME_SYSTEM = "system";
     private static final String THEME_LIGHT = "light";
     private static final String THEME_DARK = "dark";
@@ -85,6 +94,9 @@ public class MainActivity extends AppCompatActivity {
     /** 上一次渲染时的运行态，用来判断"刚进入运行中"该播强调动画。 */
     private boolean lastRunning;
     private String lastLog;
+
+    /** 刚从 ColorOS 加白设置页回来:这一次回前台不弹冻结提示,免得来回弹(CMP-236)。 */
+    private boolean suppressFreezePrompt;
 
     private final SharedPreferences.OnSharedPreferenceChangeListener stateListener =
             (prefs, key) -> {
@@ -193,6 +205,7 @@ public class MainActivity extends AppCompatActivity {
 
         findViewById(R.id.battery).setOnClickListener(v -> requestIgnoreBatteryOptimizations());
         openPanelButton.setOnClickListener(v -> openPanel());
+        findViewById(R.id.freeze_check).setOnClickListener(v -> showFreezeSelfCheck());
 
         // 方法名不能叫 onStart/onStop：会与 Activity 的生命周期回调撞名，编译期直接报
         // "cannot override onStart() in Activity"（首跑 39012779007 就是这么挂的）。
@@ -246,10 +259,18 @@ public class MainActivity extends AppCompatActivity {
         lastRunning = isRunning();
         renderState();
         renderLog();
+        // 后台被系统冻结的判定(CMP-236):回前台这一刻断档最清晰(冻结已解、心跳还没恢复)。
+        // 探测链在 ProxyService 侧,这里只负责判定结果落地成「提示 + 去加白」。
+        if (ProxyService.onAppForeground(this) && !suppressFreezePrompt) {
+            promptFreeze(ProxyService.prefs(this).getLong(ProxyService.KEY_FREEZE_GAP, 0));
+        }
+        suppressFreezePrompt = false;
     }
 
     @Override
     protected void onPause() {
+        // 开始一段新的后台期(CMP-236):冻结只发生在后台。
+        ProxyService.onAppBackground();
         ProxyService.prefs(this).unregisterOnSharedPreferenceChangeListener(stateListener);
         LogBuffer.removeListener(refreshLog);
         super.onPause();
@@ -493,7 +514,20 @@ public class MainActivity extends AppCompatActivity {
      * 只能用 intent:// 把 app 唤起来由它来重启 —— 用户不用回 app 手点。
      */
     private void handleRestartIntent(Intent intent) {
-        if (intent == null || !"1".equals(intent.getStringExtra(EXTRA_RESTART))) {
+        if (intent == null) {
+            return;
+        }
+        // CMP-236:「去加白」点进来的 intent，打开应用详情页。
+        handleWhitelistIntent(intent);
+        if ("1".equals(intent.getStringExtra(EXTRA_FREEZE_TEST))) {
+            // 验收演练：注入一次「被冻结」并直接弹提示。
+            // 置 suppress：onCreate→onResume 那段会再判一次，免得连弹两遍。
+            intent.removeExtra(EXTRA_FREEZE_TEST);
+            ProxyService.injectFreezeForTest(45_000L);
+            suppressFreezePrompt = true;
+            promptFreeze(45_000L);
+        }
+        if (!"1".equals(intent.getStringExtra(EXTRA_RESTART))) {
             return;
         }
         // 消费掉：否则旋转屏幕重建 Activity 时会再重启一次。
@@ -503,6 +537,81 @@ public class MainActivity extends AppCompatActivity {
         // stopService 是异步的，等它把服务拆干净再拉起来，否则新的 onStartCommand
         // 会撞上「旧实例还 running」而被忽略。
         new Handler(Looper.getMainLooper()).postDelayed(this::startProxy, 500);
+    }
+
+    // ======================== 后台冻结提示与加白入口(CMP-236)========================
+
+    /** 处理面板的「去加白」intent(CMP-236)。 */
+    private void handleWhitelistIntent(Intent intent) {
+        if (!"1".equals(intent.getStringExtra(EXTRA_WHITELIST))) {
+            return;
+        }
+        intent.removeExtra(EXTRA_WHITELIST);
+        openAppDetails();
+    }
+
+    /**
+     * 疑似被系统冻结时的原生提示(CMP-236)。
+     *
+     * 只有 App 回到前台才提示:冻结期整个 uid 不调度,提示弹不出来也传不到面板。
+     */
+    private void promptFreeze(long gapMs) {
+        String msg = (gapMs > 0 ? "刚才退到后台 " + (gapMs / 1000) + " 秒内代理没有响应。\n\n" : "")
+                + "手机系统(ColorOS)可能把本应用的后台行为限制住了,建议加白:\n\n"
+                + getString(R.string.whitelist_path)
+                + "\n\n" + getString(R.string.whitelist_note)
+                + "\n\n点「去加白」打开应用详情页,依次进入耗电管理。";
+        new AlertDialog.Builder(this)
+                .setTitle("疑似后台被冻结")
+                .setMessage(msg)
+                .setPositiveButton("去加白", (d, w) -> openAppDetails())
+                .setNegativeButton("稍后", null)
+                .show();
+    }
+
+    /**
+     * 跳到本应用的系统详情页(CMP-236)。
+     *
+     * 不硬编 ColorOS 私有 intent:各版本 action/开关名都会变。落到应用详情页 +
+     * 文案指路(耗电管理 → 耗电行为控制 → 完全允许后台行为)是实测能走通的路径。
+     */
+    private void openAppDetails() {
+        suppressFreezePrompt = true;
+        try {
+            startActivity(new Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:" + getPackageName())));
+        } catch (Exception e) {
+            // 个别 ROM 没这个页:退回全部应用列表页,至少让用户能自己找。
+            try {
+                startActivity(new Intent(Settings.ACTION_APPLICATION_SETTINGS));
+            } catch (Exception e2) {
+                toast("打不开系统设置页,请手动进入:设置 → 应用管理 → oc2api → 耗电管理");
+                suppressFreezePrompt = false;
+            }
+        }
+    }
+
+    /** 自检入口(CMP-236):点一下就能看到当前是否疑似被冻结 / 加白是否生效。 */
+    private void showFreezeSelfCheck() {
+        int st = ProxyService.prefs(this).getInt(
+                ProxyService.KEY_FREEZE_STATE, ProxyService.FREEZE_STATE_UNKNOWN);
+        long gap = ProxyService.prefs(this).getLong(ProxyService.KEY_FREEZE_GAP, 0);
+        String msg;
+        if (st == ProxyService.FREEZE_STATE_FROZEN) {
+            msg = "上次退到后台时疑似被系统冻结(心跳断档 " + (gap / 1000) + " 秒)。\n\n"
+                    + "请按这个路径加白:\n" + getString(R.string.whitelist_path);
+        } else if (st == ProxyService.FREEZE_STATE_OK) {
+            msg = "上次退到后台没有再被冻结 —— 加白已生效。";
+        } else {
+            msg = "还没有可以判断的记录:先切到别的应用待一会儿,再回来点这里。";
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("后台冻结自检")
+                .setMessage(msg)
+                .setPositiveButton("去加白", (d, w) -> openAppDetails())
+                .setNegativeButton("知道了", null)
+                .show();
     }
 
     private void stopProxy() {

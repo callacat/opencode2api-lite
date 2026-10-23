@@ -5,11 +5,13 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.util.Log;
 
 import java.io.BufferedReader;
@@ -67,6 +69,22 @@ public class ProxyService extends Service {
     static final String STATE_RUNNING = "running";
     static final String STATE_ERROR = "error";
 
+    /** 上一次退到后台的冻结判定（CMP-236）：0=没判过，1=正常，2=疑似被冻结。 */
+    static final int FREEZE_STATE_UNKNOWN = 0;
+    static final int FREEZE_STATE_OK = 1;
+    static final int FREEZE_STATE_FROZEN = 2;
+    static final String KEY_FREEZE_STATE = "freeze_state";
+    static final String KEY_FREEZE_GAP = "freeze_gap";
+
+    /**
+     * 后台冻结判定器(CMP-236)。static:Activity 与服务同进程,共用一份。
+     * 判据与红线(不读自己 uid 的 cgroup.freeze)见 FreezeDetector 的类注释。
+     */
+    private static final FreezeDetector FREEZE = new FreezeDetector();
+
+    /** 本段后台期的冻结是否已经记过状态/日志(避免每次回前台重复记)。 */
+    private static volatile boolean freezeRecorded;
+
     static final int DEFAULT_PORT = 8000;
 
     /** 必须 lib 前缀 + .so 后缀：否则系统不解压到 nativeLibraryDir，也就不可执行。 */
@@ -105,6 +123,53 @@ public class ProxyService extends Service {
 
     static SharedPreferences prefs(android.content.Context ctx) {
         return ctx.getSharedPreferences(PREFS, MODE_PRIVATE);
+    }
+
+    // ======================== 后台冻结判定(CMP-236)========================
+
+    /** App 切到后台(MainActivity.onPause 调):开始一段新的后台期。 */
+    static void onAppBackground() {
+        FREEZE.onBackground(SystemClock.elapsedRealtime());
+        freezeRecorded = false;
+    }
+
+    /**
+     * App 切回前台(MainActivity.onResume 调):判本段后台期有没有被系统冻结,
+     * 并记状态 + 日志。
+     *
+     * @return true = 疑似被冻结(调用方给原生提示 +「去加白」跳转)
+     */
+    static boolean onAppForeground(Context ctx) {
+        boolean frozen = FREEZE.onForeground(SystemClock.elapsedRealtime(), SystemClock.uptimeMillis());
+        if (frozen) {
+            recordFreezeIfNeeded(ctx, FREEZE.frozenGapMs());
+        } else if (prefs(ctx).getInt(KEY_FREEZE_STATE, FREEZE_STATE_UNKNOWN) == FREEZE_STATE_FROZEN) {
+            // 上次疑似冻结、这次没有 ⇒ 多半是加白生效了。翻成 OK 并留一条日志当自检证据。
+            prefs(ctx).edit().putInt(KEY_FREEZE_STATE, FREEZE_STATE_OK).apply();
+            LogBuffer.append(ctx.getFilesDir(), "本次退后台未检测到冻结(加白生效或未触发)");
+        }
+        return frozen;
+    }
+
+    /** 记一次冻结判定:prefs 存状态 + 日志页留痕。同一段后台期只记一次。 */
+    private static void recordFreezeIfNeeded(Context ctx, long gapMs) {
+        if (freezeRecorded) {
+            return;
+        }
+        freezeRecorded = true;
+        prefs(ctx).edit()
+                .putInt(KEY_FREEZE_STATE, FREEZE_STATE_FROZEN)
+                .putLong(KEY_FREEZE_GAP, gapMs)
+                .apply();
+        String msg = "疑似被系统后台冻结:探活心跳断档 " + (gapMs / 1000) + " 秒(设备仍醒着)。"
+                + "需在 ColorOS 加白:" + ctx.getString(R.string.whitelist_path);
+        Log.w(TAG, msg);
+        LogBuffer.append(ctx.getFilesDir(), msg);
+    }
+
+    /** 验收演练用(CMP-236):注入一次「疑似被冻结」。 */
+    static void injectFreezeForTest(long gapMs) {
+        FREEZE.injectFreeze(gapMs);
     }
 
     /** 局域网模式必须带密码：返回空串表示配置不合法（UI 层也拦一次，这里是兜底）。 */
@@ -156,6 +221,8 @@ public class ProxyService extends Service {
     public void onDestroy() {
         alive = false;
         running = false;
+        // 服务停了就没有心跳可言:清掉基准与结论,别让陈旧断档在下次回前台时误报冻结(CMP-236)。
+        FREEZE.reset();
         setState(STATE_IDLE, null);
         Process p = process;
         if (p != null) {
@@ -196,6 +263,8 @@ public class ProxyService extends Service {
             }
             // 置空：探活线程靠「process == 我那一个」判断自己该不该退出。
             process = null;
+            // 心跳源(子进程)没了:清掉基准,别把「子进程重启期间的空档」误判成系统冻结(CMP-236)。
+            FREEZE.reset();
             if (!running) {
                 return;
             }
@@ -306,12 +375,14 @@ public class ProxyService extends Service {
         Thread t = new Thread(() -> {
             long start = System.currentTimeMillis();
             int fail = 0;
+            FREEZE.resetTick(SystemClock.elapsedRealtime(), SystemClock.uptimeMillis());
             while (running && process == p) {
                 try {
                     Thread.sleep(PROBE_INTERVAL_MS);
                 } catch (InterruptedException e) {
                     return;
                 }
+                FREEZE.onTick(SystemClock.elapsedRealtime(), SystemClock.uptimeMillis());
                 if (!running || process != p) {
                     return;
                 }
