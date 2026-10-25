@@ -104,7 +104,7 @@ func TestAcceptUAVersion(t *testing.T) {
 		{"1.19.3", false},        // npm 旧包线，低于地板
 		{"2.1.0", false},         // 低于地板
 		{ocUABakedVersion, true}, // 等于地板
-		{"2.1.2", true},
+		{"2.1.99", true}, // 假上游 live：须高于地板，抬地板后仍应被采用
 	}
 	for _, c := range cases {
 		if got := acceptUAVersion(c.ver); got != c.want {
@@ -122,7 +122,7 @@ func TestUAVersionFollowsUpdateAPI(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("mode") {
 		case "ok":
-			fmt.Fprint(w, `{"artifacts":[{"distribution":"npm","version":"2.1.2","active":true}]}`)
+			fmt.Fprint(w, `{"artifacts":[{"distribution":"npm","version":"2.1.99","active":true}]}`)
 		case "stale":
 			fmt.Fprint(w, `{"artifacts":[{"distribution":"npm","version":"1.19.3","active":true}]}`)
 		default:
@@ -145,7 +145,7 @@ func TestUAVersionFollowsUpdateAPI(t *testing.T) {
 			t.Fatalf("冷缓存应先回兜底地板，得到 %q", got)
 		}
 		refreshOCUA()
-		if got, want := ocClientUA(), "opencode/latest/2.1.2/cli"; got != want {
+		if got, want := ocClientUA(), "opencode/latest/2.1.99/cli"; got != want {
 			t.Fatalf("UA 应拼成 %q，得到 %q", want, got)
 		}
 	})
@@ -155,7 +155,7 @@ func TestUAVersionFollowsUpdateAPI(t *testing.T) {
 		refreshOCUA()
 		ocUpdateAPIURL = srv.URL + "/down"
 		refreshOCUA()
-		if got, want := ocClientUA(), "opencode/latest/2.1.2/cli"; got != want {
+		if got, want := ocClientUA(), "opencode/latest/2.1.99/cli"; got != want {
 			t.Fatalf("刷新失败应保留当前 UA，得到 %q", got)
 		}
 	})
@@ -165,15 +165,15 @@ func TestUAVersionFollowsUpdateAPI(t *testing.T) {
 		refreshOCUA()
 		ocUpdateAPIURL = srv.URL + "/stale"
 		refreshOCUA()
-		if got, want := ocClientUA(), "opencode/latest/2.1.2/cli"; got != want {
+		if got, want := ocClientUA(), "opencode/latest/2.1.99/cli"; got != want {
 			t.Fatalf("低于地板的版本应被丢弃，得到 %q", got)
 		}
 	})
 
 	t.Run("兜底地板不低于当前上游", func(t *testing.T) {
 		reset(t, "down")
-		if compareVersion(ocUABakedVersion, "2.1.1") < 0 {
-			t.Fatalf("兜底地板 %s 低于当前上游 2.1.1，取不到版本时会全量 426", ocUABakedVersion)
+		if compareVersion(ocUABakedVersion, "2.1.3") < 0 {
+			t.Fatalf("兜底地板 %s 低于当前上游 2.1.3，取不到版本时会全量 426", ocUABakedVersion)
 		}
 		if got, want := ocClientUA(), buildOCUA(ocUABakedVersion); got != want {
 			t.Fatalf("冷启动兜底 UA 应为 %q，得到 %q", want, got)
@@ -190,7 +190,7 @@ func TestUAFloorStaleWarning(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("mode") {
 		case "newer":
-			fmt.Fprintf(w, `{"artifacts":[{"distribution":"npm","version":"2.1.2","active":true}]}`)
+			fmt.Fprintf(w, `{"artifacts":[{"distribution":"npm","version":"2.1.99","active":true}]}`)
 		default:
 			fmt.Fprintf(w, `{"artifacts":[{"distribution":"npm","version":"%s","active":true}]}`, ocUABakedVersion)
 		}
