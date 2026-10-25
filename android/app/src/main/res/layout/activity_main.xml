@@ -189,6 +189,14 @@
                     android:gravity="start|center_vertical"
                     android:text="@string/battery" />
 
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/freeze_check"
+                    style="@style/Widget.Material3.Button.TextButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:gravity="start|center_vertical"
+                    android:text="@string/freeze_check" />
+
                 <!--
                   CMP-159：更新出站代理。放在配置卡最末，不动首屏已有的 端口/密码/LAN 排布
                   （配置卡本来就快满，插在中间会把 LAN 开关挤出首屏）。
