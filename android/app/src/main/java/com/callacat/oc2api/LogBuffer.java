@@ -95,8 +95,12 @@ final class LogBuffer {
             if (writer == null) {
                 File f = new File(filesDir, LOG_NAME);
                 // 超上限就整个重来：按行算大小要全读一遍，而这里本来也只是给人看个近况。
-                if (f.isFile() && f.length() > MAX_FILE_BYTES && !f.delete()) {
-                    return;
+                if (f.isFile() && f.length() > MAX_FILE_BYTES) {
+                    if (!f.delete()) {
+                        return;
+                    }
+                    // 删了文件要把 writer 置空，否则下一次会继续写已删除的句柄（静默失败）
+                    writer = null;
                 }
                 writer = new BufferedWriter(new FileWriter(f, true));
                 file = f;
